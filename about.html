@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>プロフィール | 日本史のB面 系図版</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@400;600&family=Zen+Kaku+Gothic+New:wght@400;500&family=Cormorant+Garamond:ital@1&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#f9faf9;
+    --card:#eceae4;
+    --ink:#2b2f2d;
+    --ink-soft:#6b675c;
+    --line:#ddd6c6;
+    --gold:#a4926a;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; }
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Zen Kaku Gothic New', sans-serif;
+    line-height:1.8;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{
+    max-width:640px;
+    margin:0 auto;
+    padding:72px 24px 120px;
+  }
+  header{ margin-bottom:40px; }
+  .site-nav{
+    display:flex;
+    flex-wrap:wrap;
+    margin-bottom:28px;
+  }
+  .site-nav a{
+    font-size:13px;
+    color:var(--ink-soft);
+    text-decoration:none;
+    padding:0 14px;
+    border-right:1px solid var(--line);
+  }
+  .site-nav a:first-child{ padding-left:0; }
+  .site-nav a:last-child{ border-right:none; }
+  .site-nav a:hover{ color:var(--ink); }
+  .site-nav a.active{ color:var(--ink); font-weight:500; }
+  .brush-rule{
+    height:1px;
+    border:none;
+    margin:0;
+    background:linear-gradient(90deg, var(--gold), transparent 75%);
+  }
+  .page-title{
+    font-family:'Zen Old Mincho', serif;
+    font-size:clamp(24px,4vw,30px);
+    font-weight:600;
+    letter-spacing:.06em;
+    margin:32px 0 32px;
+  }
+  main h2{
+    font-family:'Zen Old Mincho', serif;
+    font-size:17px;
+    font-weight:600;
+    letter-spacing:.03em;
+    margin:36px 0 12px;
+  }
+  main p{
+    font-size:14.5px;
+    margin:0 0 18px;
+  }
+  main ul{
+    margin:0 0 18px;
+    padding-left:1.3em;
+  }
+  main li{
+    font-size:14.5px;
+    margin-bottom:6px;
+  }
+  .ink-soft{ color:var(--ink-soft); }
+  footer{
+    margin-top:64px;
+    font-size:12px;
+    color:var(--ink-soft);
+  }
+  label{
+    display:block;
+    font-size:13.5px;
+    color:var(--ink-soft);
+    margin-bottom:18px;
+  }
+  input, textarea{
+    display:block;
+    width:100%;
+    margin-top:6px;
+    padding:10px 12px;
+    font-family:'Zen Kaku Gothic New', sans-serif;
+    font-size:14px;
+    color:var(--ink);
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:0;
+  }
+  textarea{ min-height:120px; resize:vertical; }
+  button{
+    font-family:'Zen Kaku Gothic New', sans-serif;
+    font-size:14px;
+    color:var(--paper);
+    background:var(--ink);
+    border:none;
+    padding:11px 28px;
+    cursor:pointer;
+  }
+  button:hover{ background:var(--ink-soft); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <nav class="site-nav">
+      <a href="index.html">家系図一覧</a>
+      <a href="about.html" class="active">プロフィール</a>
+      <a href="policy.html">方針・注意事項</a>
+      <a href="privacy.html">プライバシーポリシー</a>
+      <a href="contact.html">お問い合わせ</a>
+    </nav>
+    <hr class="brush-rule">
+  </header>
+  <main>
+    <h1 class="page-title">プロフィール</h1>
+    <p>はじめまして。当サイト「日本史のB面・系図版」を、一人で制作・運営しています。</p>
+    <p>戦国武将の系図を、年表や家系図データベースとしてではなく、「人と人のつながりの物語」として見せたいという思いから、このサイトを一人で制作しています。</p>
+    <p>系図を作る上で大切にしていることが二つあります。</p>
+    <p>ひとつは、父方・母方どちらの血筋も対等に扱うことです。歴史上の記録は父系を中心に残ることが多いですが、母方の系譜も同じだけの厚みを持って描くようにしています。</p>
+    <p>もうひとつは、名前が記録に残らなかった女性たちを、欄を空けたり省略したりしないことです。「氏名不詳」と明記した上で、その方がつないだ家族関係を系図の中にきちんと位置づけています。</p>
+    <p>系図はパン・ズームで自由に動かせるインタラクティブな形式で公開しています。武将ごとに、できる限り史料に基づいて三代前後まで遡って作成しています。詳しい方針は<a href="policy.html">方針・注意事項</a>のページにまとめています。</p>
+
+  </main>
+  <footer>&copy; 日本史のB面</footer>
+</div>
+</body>
+</html>
