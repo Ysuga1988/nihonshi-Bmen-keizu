@@ -958,6 +958,20 @@ const nodeById = Object.fromEntries(nodes.map(n=>[n.id,n]));
 })();
 
 let worldW, worldH, OFX, OFY;
+
+/* ==== 閲覧専用モード制御 ====
+   URLに ?edit=1 が付いている時だけ編集UIを有効化する。
+   通常の公開URL(パラメータなし)では、編集モードボタンを隠し、
+   タイトル/サブタイトルの直接編集もできないようにする。 */
+const EDIT_ALLOWED = new URLSearchParams(location.search).get('edit') === '1';
+(function applyViewOnlyMode(){
+  const btn = document.getElementById('editModeBtn');
+  if(btn) btn.style.display = EDIT_ALLOWED ? '' : 'none';
+  const t = document.getElementById('mainTitle'), s = document.getElementById('mainSubtitle');
+  if(t) t.contentEditable = EDIT_ALLOWED ? 'true' : 'false';
+  if(s) s.contentEditable = EDIT_ALLOWED ? 'true' : 'false';
+})();
+
 let editMode = false;
 let justDragged = false;
 let dragState = null;
