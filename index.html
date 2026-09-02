@@ -124,6 +124,21 @@
     color:var(--ink-soft);
   }
   .house.pending .house-name{ color:var(--ink-soft); }
+  .retainer-block{
+    margin-top:4px;
+    padding-left:18px;
+    border-left:1px dashed var(--line);
+  }
+  .retainer-label{
+    font-family:'Cormorant Garamond', serif;
+    font-style:italic;
+    font-size:12.5px;
+    color:var(--ink-soft);
+    margin:12px 0 2px;
+  }
+  a.entry-link.retainer{ padding-top:8px; padding-bottom:8px; }
+  a.entry-link.retainer .figure-name{ font-size:14.5px; font-weight:400; }
+  a.entry-link.retainer .figure-meta{ font-size:12px; }
   .pending-label{
     font-family:'Cormorant Garamond', serif;
     font-style:italic;
@@ -244,7 +259,7 @@
       </div>
     </section>
 
-    <!-- 公開済み: 上杉家 -->
+    <!-- 公開済み: 上杉家(景勝・謙信) + 家臣:直江家 -->
     <section class="house" style="--house-color:#2b2f2d">
       <div class="house-mark"></div>
       <div class="house-info">
@@ -253,18 +268,17 @@
           <span class="figure-name">上杉景勝</span>
           <span class="figure-meta">実父・長尾政景の代から米沢藩主家(綱憲)まで ・ 全10名</span>
         </a>
-      </div>
-    </section>
-
-    <!-- 公開済み: 直江家 -->
-    <section class="house" style="--house-color:#2b2f2d">
-      <div class="house-mark"></div>
-      <div class="house-info">
-        <h2 class="house-name">直江家</h2>
-        <a class="entry-link" href="naoe_kanetsugu_genealogy.html">
-          <span class="figure-name">直江兼続</span>
-          <span class="figure-meta">樋口家の生まれから直江家を継ぐまで ・ 全9名</span>
+        <a class="entry-link" href="uesugi_kenshin_genealogy.html">
+          <span class="figure-name">上杉謙信</span>
+          <span class="figure-meta">祖父・能景の代から養子2人まで ・ 全8名</span>
         </a>
+        <div class="retainer-block">
+          <p class="retainer-label">上杉家家臣</p>
+          <a class="entry-link retainer" href="naoe_kanetsugu_genealogy.html">
+            <span class="figure-name">直江兼続</span>
+            <span class="figure-meta">樋口家の生まれから直江家を継ぐまで ・ 全9名</span>
+          </a>
+        </div>
       </div>
     </section>
 
@@ -292,7 +306,7 @@
       </div>
     </section>
 
-    <!-- 公開済み: 徳川家 -->
+    <!-- 公開済み: 徳川家 + 家臣:石川家 -->
     <section class="house" style="--house-color:#2b2f2d">
       <div class="house-mark"></div>
       <div class="house-info">
@@ -301,6 +315,13 @@
           <span class="figure-name">徳川家康</span>
           <span class="figure-meta">安城松平家の代から御三家・孫世代まで ・ 全44名</span>
         </a>
+        <div class="retainer-block">
+          <p class="retainer-label">徳川家家臣</p>
+          <a class="entry-link retainer" href="ishikawa_kazumasa_genealogy.html">
+            <span class="figure-name">石川数正</span>
+            <span class="figure-meta">祖父・清兼の代から松本城主家の改易まで ・ 全11名</span>
+          </a>
+        </div>
       </div>
     </section>
 
@@ -312,18 +333,6 @@
         <a class="entry-link" href="takeda_shingen_genealogy.html">
           <span class="figure-name">武田信玄</span>
           <span class="figure-meta">曾祖父・信昌の代から武田家滅亡まで ・ 全16名</span>
-        </a>
-      </div>
-    </section>
-
-    <!-- 公開済み: 上杉家(謙信) -->
-    <section class="house" style="--house-color:#2b2f2d">
-      <div class="house-mark"></div>
-      <div class="house-info">
-        <h2 class="house-name">上杉家(謙信)</h2>
-        <a class="entry-link" href="uesugi_kenshin_genealogy.html">
-          <span class="figure-name">上杉謙信</span>
-          <span class="figure-meta">祖父・能景の代から養子2人まで ・ 全8名</span>
         </a>
       </div>
     </section>
@@ -348,6 +357,18 @@
         <a class="entry-link" href="sanada_masayuki_genealogy.html">
           <span class="figure-name">真田昌幸・幸村</span>
           <span class="figure-meta">祖父・幸隆の代から仙台真田家まで ・ 全12名</span>
+        </a>
+      </div>
+    </section>
+
+    <!-- 公開済み: 織田家 -->
+    <section class="house" style="--house-color:#2b2f2d">
+      <div class="house-mark"></div>
+      <div class="house-info">
+        <h2 class="house-name">織田家</h2>
+        <a class="entry-link" href="oda_nobunaga_genealogy.html">
+          <span class="figure-name">織田信長</span>
+          <span class="figure-meta">祖父・信定の代から三法師(秀信)まで ・ 全18名</span>
         </a>
       </div>
     </section>
