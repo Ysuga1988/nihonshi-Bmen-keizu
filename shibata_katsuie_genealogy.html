@@ -1,11 +1,409 @@
 <!DOCTYPE html>
-<html lang="ja">
-<head>
+<html lang="ja"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <title>柴田勝家 家族系図マップ(自動レイアウト版)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@500;600;700;900&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=Cormorant+Garamond:ital,wght@0,500;1,500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@500;600;700;900&amp;family=Zen+Kaku+Gothic+New:wght@400;500;700&amp;family=Cormorant+Garamond:ital,wght@0,500;1,500&amp;family=Shippori+Antique+B1&amp;display=swap" rel="stylesheet">
 <style>
   :root{
     --paper:#f9faf9; --paper-soft:#f3f4f2; --card:#ececea; --ink:#2b2f2d; --ink-soft:#847f72; --line:#dcdcd7;
@@ -17,14 +415,14 @@
   }
   *{box-sizing:border-box;}
   html,body{margin:0;padding:0;}
-  body{ font-family:"Zen Kaku Gothic New", sans-serif; color:var(--ink); background:var(--paper); }
+  body{ font-family:"Shippori Antique B1", serif; color:var(--ink); background:var(--paper); }
   .app{ position:relative; width:100%; border:1px solid var(--line); overflow:hidden; }
 
   .topbar{
     display:flex; align-items:center; gap:14px; flex-wrap:wrap;
     padding:18px 20px 14px; background:var(--paper); color:var(--ink); border-bottom:1px solid var(--ink);
   }
-  .title{ font-family:"Zen Old Mincho", serif; font-weight:700; font-size:20px; letter-spacing:.08em; }
+  .title{ font-family:"Shippori Antique B1", serif; font-weight:700; font-size:20px; letter-spacing:.08em; }
   .title [contenteditable]{ outline:none; border-radius:2px; padding:1px 3px; margin:-1px -3px; }
   .title [contenteditable]:hover{ background:var(--paper-soft); }
   .title [contenteditable]:focus{ background:var(--card); box-shadow:0 0 0 1px var(--celadon); }
@@ -36,7 +434,7 @@
   .resize-handle span{ width:36px; height:3px; border-radius:2px; background:var(--line); }
   .resize-handle:hover span{ background:var(--celadon); }
   .resize-handle.dragging span{ background:var(--brick); }
-  .title small{ display:block; font-family:"Zen Kaku Gothic New", sans-serif; font-weight:400; font-size:10.5px; color:var(--ink-soft); margin-top:5px; letter-spacing:.02em; }
+  .title small{ display:block; font-family:"Shippori Antique B1", serif; font-weight:400; font-size:10.5px; color:var(--ink-soft); margin-top:5px; letter-spacing:.02em; }
   .search-wrap{ position:relative; margin-left:auto; width:200px; }
   .search-wrap input{ width:100%; font-size:12.5px; padding:7px 12px; border-radius:0; border:1px solid var(--line); outline:none; background:var(--paper); color:var(--ink); }
   .search-wrap input:focus{ border-color:var(--ink); }
@@ -76,14 +474,14 @@
   .node{
     position:absolute; width:158px; padding:10px 11px 9px;
     border-radius:0; background:var(--card);
-    border:1px solid var(--line); border-top:2px solid var(--nc, var(--ink));
+    border:1px solid var(--ink);
     box-shadow:0 1px 0 rgba(32,30,26,.04);
     cursor:pointer; transform:translate(-50%,-50%);
     transition:box-shadow .15s ease, transform .15s ease, opacity .15s ease;
   }
   .node .fam{ font:500 8.5px "Zen Kaku Gothic New",sans-serif; letter-spacing:.14em; color:var(--nc,var(--ink-soft)); }
-  .node .name{ font-family:"Zen Old Mincho", serif; font-weight:600; font-size:15px; margin-top:5px; line-height:1.3; color:var(--ink); letter-spacing:.03em; }
-  .node.unnamed .name{ font-family:"Cormorant Garamond",serif; font-style:italic; font-weight:500; color:var(--ink-soft); }
+  .node .name{ font-family:"Shippori Antique B1", serif; font-weight:400; font-size:16px; margin-top:5px; line-height:1.3; color:var(--ink); letter-spacing:.03em; }
+  .node.unnamed .name{ font-family:"Shippori Antique B1", serif; font-weight:500; color:var(--ink-soft); }
   .node.unnamed{ border-style:dashed; }
   .node .role{ margin-top:5px; font-size:9.5px; color:var(--ink-soft); line-height:1.4; }
   .node .pill{ display:inline-block; margin-top:7px; padding:2px 8px; border-radius:20px; font-size:8.5px; letter-spacing:.03em; background:transparent; border:1px solid currentColor; }
@@ -91,6 +489,19 @@
   .node.dim{ opacity:.2; }
   .node.hi{ box-shadow:0 0 0 1px var(--celadon), 0 4px 12px rgba(32,30,26,.14); transform:translate(-50%,-50%) scale(1.05); z-index:10; }
   .node.selected{ box-shadow:0 0 0 1px var(--brick), 0 4px 14px rgba(32,30,26,.16); z-index:11; }
+
+  /* 主人公カード(柴田勝家):一回り大きく、金と朱の色でひと目でわかるようにする */
+  .node.protagonist{
+    width:230px; padding:16px 18px 14px; z-index:5;
+    background: linear-gradient(180deg, rgba(164,146,106,.20), rgba(164,146,106,.06) 60%), var(--card);
+    border:2px solid var(--brick);
+    box-shadow:0 3px 14px rgba(156,80,64,.22);
+  }
+  .node.protagonist .fam{ color:var(--brick); font-weight:700; font-size:9.5px; }
+  .node.protagonist .name{ font-size:21px; }
+  .node.protagonist .role{ font-size:10.5px; }
+  .node.protagonist.hi{ transform:translate(-50%,-50%) scale(1.05); }
+  .node.protagonist.selected{ box-shadow:0 0 0 1.5px var(--brick), 0 5px 16px rgba(156,80,64,.28); }
 
   .house-shibata{ --nc:var(--shibata); } .house-oda{ --nc:var(--oda); } .house-azai{ --nc:var(--azai); }
   .house-sakuma{ --nc:var(--sakuma); } .house-hineno{ --nc:var(--hineno); } .house-other{ --nc:var(--gray); }
@@ -115,6 +526,28 @@
     background:var(--ink); color:var(--paper); cursor:pointer;
   }
   .edit-panel-buttons button#resetPositionsBtn{ background:var(--paper); color:var(--ink); }
+  .edit-panel-buttons button#saveFileBtn{ background:var(--brick); color:var(--paper); border-color:var(--brick); font-weight:700; }
+
+  .save-overlay{
+    display:none; position:fixed; inset:0; z-index:1000;
+    background:rgba(32,30,26,.55);
+    align-items:center; justify-content:center;
+  }
+  .save-overlay.show{ display:flex; }
+  .save-overlay-box{
+    background:var(--paper,#fff); width:min(640px,92vw); max-height:86vh;
+    padding:22px 24px; overflow:auto; border:1px solid var(--ink,#222);
+  }
+  .save-overlay-box h4{ margin:0 0 8px; font-family:"Shippori Antique B1", serif; font-size:18px; }
+  .save-overlay-box p{ font-size:12.5px; line-height:1.7; margin:0 0 10px; color:var(--ink-soft,#555); }
+  .save-overlay-box .save-overlay-note{ background:rgba(156,80,64,.08); border-left:3px solid var(--brick,#9c5040); padding:8px 10px; }
+  .save-overlay-buttons{ display:flex; gap:8px; margin:10px 0; }
+  .save-overlay-buttons button{ padding:8px 14px; font-size:13px; border:1px solid var(--ink,#222); background:var(--card,#eee); cursor:pointer; }
+  #copyFullHtmlBtn{ background:var(--brick,#9c5040); color:#fff; border-color:var(--brick,#9c5040); font-weight:700; }
+  #fullHtmlOutput{
+    width:100%; height:220px; box-sizing:border-box; font-family:monospace; font-size:11px;
+    padding:8px; margin-top:4px;
+  }
   #copyOutput{
     display:none; width:100%; height:110px; font-size:10.5px; font-family:monospace;
     padding:8px; border-radius:0; border:1px solid var(--line); resize:vertical; background:var(--paper-soft);
@@ -133,11 +566,11 @@
   }
   .edit-form.show{ display:block; }
   .edit-form .close{ position:absolute; top:10px; right:12px; cursor:pointer; font-size:14px; color:var(--ink-soft); background:none; border:none; }
-  .edit-form h4{ margin:0 0 12px; font-family:"Zen Old Mincho",serif; font-weight:600; font-size:16px; letter-spacing:.04em; }
+  .edit-form h4{ margin:0 0 12px; font-family:"Shippori Antique B1", serif; font-weight:600; font-size:16px; letter-spacing:.04em; }
   .edit-form label{ display:block; font-size:10.5px; color:var(--ink-soft); margin-top:10px; }
   .edit-form label.ef_checkbox{ display:flex; align-items:center; gap:6px; font-size:11px; color:var(--ink); margin-top:10px; }
   .edit-form input[type="text"], .edit-form select, .edit-form textarea{
-    width:100%; margin-top:3px; font-size:12px; font-family:"Zen Kaku Gothic New",sans-serif;
+    width:100%; margin-top:3px; font-size:12px; font-family:"Shippori Antique B1", serif;
     padding:6px 9px; border-radius:0; border:1px solid var(--line); background:var(--paper); color:var(--ink); resize:vertical;
   }
   .edit-form input[type="text"]:focus, .edit-form select:focus, .edit-form textarea:focus{ outline:none; border-color:var(--ink); }
@@ -165,9 +598,9 @@
   }
   .panel.show{ display:block; }
   .panel .close{ position:absolute; top:10px; right:12px; cursor:pointer; font-size:14px; color:var(--ink-soft); background:none; border:none; }
-  .panel .pname{ font-family:"Zen Old Mincho", serif; font-weight:700; font-size:19px; letter-spacing:.04em; }
-  .panel .pname.unnamed{ font-family:"Cormorant Garamond",serif; font-style:italic; font-weight:500; color:var(--ink-soft); }
-  .panel .pyomi{ font-family:"Cormorant Garamond",serif; font-style:italic; font-size:12px; color:var(--ink-soft); margin-top:3px; }
+  .panel .pname{ font-family:"Shippori Antique B1", serif; font-weight:700; font-size:19px; letter-spacing:.04em; }
+  .panel .pname.unnamed{ font-family:"Shippori Antique B1", serif; font-weight:500; color:var(--ink-soft); }
+  .panel .pyomi{ font-family:"Shippori Antique B1", serif; font-size:12px; color:var(--ink-soft); margin-top:3px; }
   .panel .ptags{ margin-top:10px; }
   .panel .ptag{ display:inline-block; padding:2px 10px; border-radius:20px; font-size:10px; margin:0 6px 6px 0; background:transparent; border:1px solid currentColor; }
   .panel .pnote{ font-size:12.5px; line-height:1.85; color:var(--ink); margin-top:10px; }
@@ -175,28 +608,28 @@
   .panel .psources ul{ margin:4px 0 0; padding-left:18px; }
 
   .list-section{ padding:26px 24px 30px; background:var(--paper); border-top:1px solid var(--ink); }
-  .list-section h3{ margin:0 0 5px; font-family:"Zen Old Mincho",serif; font-weight:700; font-size:21px; letter-spacing:.05em; }
+  .list-section h3{ margin:0 0 5px; font-family:"Shippori Antique B1", serif; font-weight:700; font-size:21px; letter-spacing:.05em; }
   .list-section .lead{ margin:0 0 18px; font-size:11.5px; color:var(--ink-soft); }
   details.person{ margin:0 0 8px; border:1px solid var(--line); border-left:2px solid var(--nc,var(--ink)); background:var(--card); border-radius:0; }
-  details.person summary{ display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; padding:12px 14px; cursor:pointer; font-family:"Zen Kaku Gothic New",sans-serif; }
-  details.person summary .dname{ font-family:"Zen Old Mincho",serif; font-size:15px; font-weight:600; letter-spacing:.02em; }
-  details.person summary .dname.unnamed{ font-family:"Cormorant Garamond",serif; font-style:italic; font-weight:500; color:var(--ink-soft); }
+  details.person summary{ display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; padding:12px 14px; cursor:pointer; font-family:"Shippori Antique B1", serif; }
+  details.person summary .dname{ font-family:"Shippori Antique B1", serif; font-size:15px; font-weight:600; letter-spacing:.02em; }
+  details.person summary .dname.unnamed{ font-family:"Shippori Antique B1", serif; font-weight:500; color:var(--ink-soft); }
   details.person summary .drole{ font-size:10.5px; color:var(--ink-soft); }
   details.person .body{ padding:0 16px 16px; border-top:1px solid var(--line); font-size:12.5px; line-height:1.85; }
-  details.person .yomi{ font-family:"Cormorant Garamond",serif; font-style:italic; font-size:11.5px; color:var(--ink-soft); letter-spacing:.03em; margin-top:11px; }
+  details.person .yomi{ font-family:"Shippori Antique B1", serif; font-size:11.5px; color:var(--ink-soft); letter-spacing:.03em; margin-top:11px; }
   details.person .src{ margin-top:9px; padding-top:7px; border-top:1px solid var(--line); font-size:10.5px; color:var(--ink-soft); }
 
   @media(max-width:640px){ .viewport{ height:70vh; } .search-wrap{ width:140px; } }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 
 <div class="app">
   <div class="topbar">
-    <div class="title"><span id="mainTitle" contenteditable="true" spellcheck="false">柴田勝家 家族系図</span><small id="mainSubtitle" contenteditable="true" spellcheck="false">座標は自動計算。人物と関係を追加するだけで配置されます。</small></div>
+    <div class="title"><span id="mainTitle" contenteditable="true" spellcheck="false" data-orig="柴田勝家 家族系図">柴田勝家 家族系図</span><small id="mainSubtitle" contenteditable="true" spellcheck="false" data-orig="座標は自動計算。人物と関係を追加するだけで配置されます。">座標は自動計算。人物と関係を追加するだけで配置されます。</small></div>
     <div class="search-wrap">
       <input id="searchInput" type="text" placeholder="人物名で検索…">
-      <div class="search-results" id="searchResults"></div>
+      <div class="search-results" id="searchResults" style="display: none;"></div>
     </div>
   </div>
   <div class="legend-row">
@@ -216,9 +649,129 @@
   </div>
 
   <div class="viewport" id="viewport">
-    <div class="world" id="world">
-      <svg class="edges" id="edges"></svg>
-      <div id="nodesLayer"></div>
+    <div class="world" id="world" style="width: 2474.62px; height: 3680px; transform: translate(-554.939px, -1376.84px) scale(1.23039);">
+      <svg class="edges" id="edges" width="2474.6214407334537" height="3680"><g class="edge" data-a="katsuie_father" data-b="katsuie">
+      <line x1="898.1136204200851" y1="812" x2="913.2247315311962" y2="972" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="890.6691759756407" y="875" width="30" height="22" rx="11"></rect><text x="905.6691759756407" y="890">父</text></g>
+    </g><g class="edge" data-a="katsuie_mother" data-b="katsuie">
+      <line x1="1032.1432500497147" y1="812" x2="948.8839907904554" y2="972" stroke="#a19c8e" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="975.5136204200851" y="875" width="30" height="22" rx="11"></rect><text x="990.5136204200851" y="890">母</text></g>
+    </g><g class="edge" data-a="nobuhide" data-b="oichi">
+      <line x1="1307.164387917045" y1="812" x2="1486.3389736013087" y2="973.0053526818608" stroke="#5c6b62" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1381.751680759177" y="875.5026763409304" width="30" height="22" rx="11"></rect><text x="1396.751680759177" y="890.5026763409304">父</text></g>
+    </g><g class="edge" data-a="oichi_mother" data-b="oichi">
+      <line x1="1440.5914609454046" y1="812" x2="1518.911900572949" y2="973.0053526818608" stroke="#a19c8e" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1464.751680759177" y="875.5026763409304" width="30" height="22" rx="11"></rect><text x="1479.751680759177" y="890.5026763409304">母</text></g>
+    </g><g class="edge" data-a="hineno_takayoshi" data-b="katsumasa_wife">
+      <line x1="236.2923962124928" y1="1160.6067472145253" x2="268.197678774755" y2="1262.4379739781782" stroke="#8a8172" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="237.2450374936239" y="1194.5223605963517" width="30" height="22" rx="11"></rect><text x="252.2450374936239" y="1209.5223605963517">父</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsusato">
+      <line x1="909.9011238750244" y1="1088" x2="885.6214399193016" y2="1248" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="872.7612818971629" y="1151" width="50" height="22" rx="11"></rect><text x="897.7612818971629" y="1166">実子説</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsutada">
+      <line x1="945.7706436270385" y1="1088" x2="1020.4413589872163" y2="1248" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="958.1060013071274" y="1151" width="50" height="22" rx="11"></rect><text x="983.1060013071274" y="1166">実子説</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsutoyo">
+      <line x1="981.9198967880175" y1="1088" x2="1156.3126898336548" y2="1248" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1050.1162933108362" y="1151" width="38" height="22" rx="11"></rect><text x="1069.1162933108362" y="1166">養子</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsumasa">
+      <line x1="838.799087003913" y1="1088" x2="590.1659444252067" y2="1268.4769039116811" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="695.4825157145599" y="1161.2384519558404" width="38" height="22" rx="11"></rect><text x="714.4825157145599" y="1176.2384519558404">養子</text></g>
+    </g><g class="edge" data-a="katsumasa" data-b="katsushige">
+      <line x1="576.7596924407809" y1="1372.4769039116811" x2="739.7212102612762" y2="1518" stroke="#9c5040" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="643.2404513510285" y="1428.2384519558404" width="30" height="22" rx="11"></rect><text x="658.2404513510285" y="1443.2384519558404">父</text></g>
+    </g><g class="edge" data-a="katsumasa_wife" data-b="katsushige">
+      <line x1="364.4900749872478" y1="1354.2558081859584" x2="717.952509308974" y2="1530.1821657922198" stroke="#8a8172" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="526.2212921481109" y="1425.218986989089" width="30" height="22" rx="11"></rect><text x="541.2212921481109" y="1440.218986989089">母</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsutoshi">
+      <line x1="1017.702509308974" y1="1087.8280344201087" x2="1300.9350625687323" y2="1253.2702752160737" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1134.3187859388531" y="1153.5491548180912" width="50" height="22" rx="11"></rect><text x="1159.3187859388531" y="1168.5491548180912">養子説</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsuharu">
+      <line x1="1017.702509308974" y1="1072.5481248658764" x2="1466.9323098997288" y2="1265.6176768760595" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1217.3174096043513" y="1152.082900870968" width="50" height="22" rx="11"></rect><text x="1242.3174096043513" y="1167.082900870968">養子説</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="katsuyuki">
+      <line x1="873.0679789370625" y1="1088" x2="731.5600550966003" y2="1267.8519567498079" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="777.3140170168315" y="1160.925978374904" width="50" height="22" rx="11"></rect><text x="802.3140170168315" y="1175.925978374904">養子説</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="adopted_daughter">
+      <line x1="1017.702509308974" y1="1063.4118851308988" x2="1636.3090465998007" y2="1272.1877494256876" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1302.0057779543872" y="1150.7998172782932" width="50" height="22" rx="11"></rect><text x="1327.0057779543872" y="1165.7998172782932">養女説</text></g>
+    </g><g class="edge" data-a="oichi" data-b="chacha">
+      <line x1="1614.081868289089" y1="1077.0053526818608" x2="1845.3895144041671" y2="1249.1418516329013" stroke="#5c6b62" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1714.735691346628" y="1146.0736021573812" width="30" height="22" rx="11"></rect><text x="1729.735691346628" y="1161.0736021573812">母</text></g>
+    </g><g class="edge" data-a="nagamasa" data-b="chacha">
+      <line x1="1941.2983642911015" y1="1078.9453164033719" x2="1921.3569603565722" y2="1249.1418516329013" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1916.3276623238369" y="1147.0435840181367" width="30" height="22" rx="11"></rect><text x="1931.3276623238369" y="1162.0435840181367">父</text></g>
+    </g><g class="edge" data-a="oichi" data-b="hatsu">
+      <line x1="1624.2071022093796" y1="1065.4149639442915" x2="2008.6214407334537" y2="1259.5903887375694" stroke="#5c6b62" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1801.4142714714167" y="1145.5026763409305" width="30" height="22" rx="11"></rect><text x="1816.4142714714167" y="1160.5026763409305">母</text></g>
+    </g><g class="edge" data-a="nagamasa" data-b="hatsu">
+      <line x1="1974.2866847178743" y1="1078.9453164033719" x2="2061.7258001793766" y2="1248" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="2003.0062424486255" y="1146.472658201686" width="30" height="22" rx="11"></rect><text x="2018.0062424486255" y="1161.472658201686">父</text></g>
+    </g><g class="edge" data-a="oichi" data-b="go">
+      <line x1="1624.2071022093796" y1="1055.9725933363168" x2="2174.6214407334537" y2="1269.032759345544" stroke="#5c6b62" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1884.4142714714167" y="1145.5026763409305" width="30" height="22" rx="11"></rect><text x="1899.4142714714167" y="1160.5026763409305">母</text></g>
+    </g><g class="edge" data-a="nagamasa" data-b="go">
+      <line x1="2005.899400113563" y1="1078.9453164033719" x2="2196.113084783688" y2="1248" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="2086.0062424486255" y="1146.472658201686" width="30" height="22" rx="11"></rect><text x="2101.0062424486255" y="1161.472658201686">父</text></g>
+    </g><g class="edge" data-a="hisamasa" data-b="nagamasa">
+      <line x1="1779.3542950704182" y1="812" x2="1906.739258402353" y2="974.9453164033719" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1828.0467767363857" y="876.4726582016859" width="30" height="22" rx="11"></rect><text x="1843.0467767363857" y="891.4726582016859">父</text></g>
+    </g><g class="edge" data-a="ono_dono" data-b="nagamasa">
+      <line x1="1648.760344317246" y1="812" x2="1875.145709155525" y2="974.9453164033719" stroke="#a19c8e" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1746.9530267363857" y="876.4726582016859" width="30" height="22" rx="11"></rect><text x="1761.9530267363857" y="891.4726582016859">母</text></g>
+    </g><g class="edge" data-a="sukemasa" data-b="hisamasa">
+      <line x1="1823.4802870867518" y1="542" x2="1758.9247315311961" y2="708" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1776.202509308974" y="608" width="30" height="22" rx="11"></rect><text x="1791.202509308974" y="623">父</text></g>
+    </g><g class="edge" data-a="kurayahime" data-b="hisamasa">
+      <line x1="1653.9247315311961" y1="542" x2="1718.4802870867518" y2="708" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1671.202509308974" y="608" width="30" height="22" rx="11"></rect><text x="1686.202509308974" y="623">母</text></g>
+    </g><g class="edge" data-a="naotane" data-b="sukemasa">
+      <line x1="1843.702509308974" y1="272" x2="1843.702509308974" y2="438" stroke="#8a9a8f" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="1828.702509308974" y="338" width="30" height="22" rx="11"></rect><text x="1843.702509308974" y="353">父</text></g>
+    </g><g class="edge" data-a="katsushige" data-b="katsuoki">
+      <line x1="797.952509308974" y1="1622" x2="797.952509308974" y2="1788" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="782.952509308974" y="1688" width="30" height="22" rx="11"></rect><text x="797.952509308974" y="1703">父</text></g>
+    </g><g class="edge" data-a="katsuoki" data-b="katsukado">
+      <line x1="797.952509308974" y1="1892" x2="797.952509308974" y2="2058" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="760.952509308974" y="1958" width="74" height="22" rx="11"></rect><text x="797.952509308974" y="1973">父(推定)</text></g>
+    </g><g class="edge" data-a="katsukado" data-b="katsutomi">
+      <line x1="797.952509308974" y1="2162" x2="797.952509308974" y2="2328" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="782.952509308974" y="2228" width="30" height="22" rx="11"></rect><text x="797.952509308974" y="2243">父</text></g>
+    </g><g class="edge" data-a="katsutomi" data-b="katsusada">
+      <line x1="793.0413981978628" y1="2432" x2="777.3636204200851" y2="2598" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="770.202509308974" y="2498" width="30" height="22" rx="11"></rect><text x="785.202509308974" y="2513">父</text></g>
+    </g><g class="edge" data-a="katsutomi" data-b="sakamoto_naoshizu">
+      <line x1="825.0117685682333" y1="2432" x2="911.3932500497147" y2="2598" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="853.202509308974" y="2498" width="30" height="22" rx="11"></rect><text x="868.202509308974" y="2513">父</text></g>
+    </g><g class="edge" data-a="katsusada" data-b="katsuhiro">
+      <line x1="777.3636204200851" y1="2702" x2="793.0413981978628" y2="2868" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="770.202509308974" y="2768" width="30" height="22" rx="11"></rect><text x="785.202509308974" y="2783">父</text></g>
+    </g><g class="edge" data-a="katsuhiro" data-b="katsumitsu">
+      <line x1="797.952509308974" y1="2972" x2="797.952509308974" y2="3138" stroke="#2b2f2d" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="782.952509308974" y="3038" width="30" height="22" rx="11"></rect><text x="797.952509308974" y="3053">父</text></g>
+    </g><g class="edge" data-a="sakamoto_naoshizu" data-b="katsufusa">
+      <line x1="933.1241142472455" y1="2702" x2="860.7809043707024" y2="3408" stroke="#a19c8e" stroke-width="2" opacity="0.6"></line>
+      <g class="edge-label"><rect x="881.952509308974" y="3038" width="30" height="22" rx="11"></rect><text x="896.952509308974" y="3053">父</text></g>
+    </g><g class="edge" data-a="katsumitsu" data-b="katsufusa">
+      <line x1="809.026583383048" y1="3242" x2="844.3784352348999" y2="3408" stroke="#9c5040" stroke-width="2" stroke-dasharray="9 7" opacity="0.6"></line>
+      <g class="edge-label"><rect x="795.702509308974" y="3308" width="62" height="22" rx="11"></rect><text x="826.702509308974" y="3323">末期養子</text></g>
+    </g><g class="edge" data-a="katsuie" data-b="oichi">
+      <line x1="1017.702509308974" y1="1029.2094860851414" x2="1464.2071022093796" y2="1025.644151804979" stroke="#8a9a8f" stroke-dasharray="2 5" stroke-width="2.4" opacity="0.75"></line>
+      <g class="edge-label"><rect x="1191.954805759177" y="1008.4268189450602" width="98" height="22" rx="11"></rect><text x="1240.954805759177" y="1023.4268189450602">婚姻 1582</text></g>
+    </g><g class="edge" data-a="oichi" data-b="nagamasa">
+      <line x1="1624.2071022093796" y1="1025.3902814490348" x2="1867.3910441637972" y2="1026.560387636198" stroke="#a19c8e" stroke-dasharray="3 5" stroke-width="1.3" opacity="0.75"></line>
+      <g class="edge-label"><rect x="1720.7990731865884" y="1006.9753345426163" width="50" height="22" rx="11"></rect><text x="1745.7990731865884" y="1021.9753345426163">前夫婦</text></g>
+    </g><g class="edge" data-a="katsumasa" data-b="katsumasa_wife">
+      <line x1="438.5283933930831" y1="1318.412650510909" x2="364.4900749872478" y2="1316.5022273789502" stroke="#8a9a8f" stroke-dasharray="2 5" stroke-width="2.4" opacity="0.75"></line>
+      <g class="edge-label"><rect x="382.50923419016544" y="1298.4574389449297" width="38" height="22" rx="11"></rect><text x="401.50923419016544" y="1313.4574389449297">婚姻</text></g>
+    </g><g class="edge" data-a="hisamasa" data-b="ono_dono">
+      <line x1="1658.702509308974" y1="760" x2="1656.515009308974" y2="760" stroke="#8a9a8f" stroke-dasharray="2 5" stroke-width="2.4" opacity="0.75"></line>
+      <g class="edge-label"><rect x="1638.608759308974" y="741" width="38" height="22" rx="11"></rect><text x="1657.608759308974" y="756">婚姻</text></g>
+    </g><g class="edge" data-a="sukemasa" data-b="kurayahime">
+      <line x1="1763.702509308974" y1="490" x2="1713.702509308974" y2="490" stroke="#8a9a8f" stroke-dasharray="2 5" stroke-width="2.4" opacity="0.75"></line>
+      <g class="edge-label"><rect x="1719.702509308974" y="471" width="38" height="22" rx="11"></rect><text x="1738.702509308974" y="486">婚姻</text></g>
+    </g></svg>
+      <div id="nodesLayer"><div class="node house-shibata" id="node-katsuie_father" style="left: 893.203px; top: 760px;"><div class="fam">柴田家</div><div class="name">伝・柴田勝義</div><div class="role">勝家の父とする説</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-other unnamed" id="node-katsuie_mother" style="left: 1059.2px; top: 760px;"><div class="fam">記録不詳</div><div class="name">氏名不詳</div><div class="role">柴田勝家の母</div><div class="pill" style="color:#a19c8e">氏名・出自不詳</div></div><div class="node house-oda" id="node-nobuhide" style="left: 1249.3px; top: 760px;"><div class="fam">織田家</div><div class="name">織田信秀</div><div class="role">お市の父</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-other unnamed" id="node-oichi_mother" style="left: 1415.3px; top: 760px;"><div class="fam">記録不詳</div><div class="name">氏名不詳</div><div class="role">お市の母</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-hineno manual" id="node-hineno_takayoshi" style="left: 220px; top: 1108.61px;"><div class="fam">日根野家</div><div class="name">日根野高吉</div><div class="role">勝重の母方祖父</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata protagonist" id="node-katsuie" style="left: 918.703px; top: 1030px;"><div class="fam">柴田家</div><div class="name">柴田勝家</div><div class="role">越前北庄城主</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-oda manual" id="node-oichi" style="left: 1544.21px; top: 1025.01px;"><div class="fam">織田家</div><div class="name">お市の方</div><div class="role">勝家の妻・浅井三姉妹の母</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-azai manual" id="node-nagamasa" style="left: 1947.39px; top: 1026.95px;"><div class="fam">浅井家</div><div class="name">浅井長政</div><div class="role">お市の前夫・三姉妹の父</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-shibata manual" id="node-katsusato" style="left: 877.731px; top: 1300px;"><div class="fam">柴田家</div><div class="name">柴田勝里</div><div class="role">実子とする後世の系譜</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata" id="node-katsutada" style="left: 1044.71px; top: 1300px;"><div class="fam">柴田家</div><div class="name">柴田勝忠</div><div class="role">実子とする後世の系譜</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata manual" id="node-katsutoyo" style="left: 1212.99px; top: 1300px;"><div class="fam">柴田家</div><div class="name">柴田勝豊</div><div class="role">養子・勝家の甥</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-sakuma manual" id="node-katsumasa" style="left: 518.528px; top: 1320.48px;"><div class="fam">佐久間家</div><div class="name">柴田勝政</div><div class="role">養子・佐久間盛次の子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-hineno unnamed manual" id="node-katsumasa_wife" style="left: 284.49px; top: 1314.44px;"><div class="fam">日根野家</div><div class="name">日根野高吉の娘</div><div class="role">勝政の妻・勝重の母</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata manual" id="node-katsutoshi" style="left: 1380.94px; top: 1300px;"><div class="fam">柴田家</div><div class="name">柴田勝敏</div><div class="role">養子とする系譜</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-shibata manual" id="node-katsuharu" style="left: 1546.93px; top: 1300px;"><div class="fam">柴田家</div><div class="name">柴田勝春</div><div class="role">養子とする系譜</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-sakuma manual" id="node-katsuyuki" style="left: 690.646px; top: 1319.85px;"><div class="fam">佐久間家</div><div class="name">佐久間勝之</div><div class="role">養子とする系譜</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-other unnamed manual" id="node-adopted_daughter" style="left: 1716.31px; top: 1299.19px;"><div class="fam">記録不詳</div><div class="name">氏名不詳の養女</div><div class="role">高城胤則の妻</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-azai manual" id="node-chacha" style="left: 1915.26px; top: 1301.14px;"><div class="fam">浅井家</div><div class="name">茶々(淀殿)</div><div class="role">お市の長女・勝家の継娘</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-azai" id="node-hatsu" style="left: 2088.62px; top: 1300px;"><div class="fam">浅井家</div><div class="name">初(常高院)</div><div class="role">お市の次女・勝家の継娘</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-azai" id="node-go" style="left: 2254.62px; top: 1300px;"><div class="fam">浅井家</div><div class="name">江(崇源院)</div><div class="role">お市の三女・勝家の継娘</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-shibata" id="node-katsushige" style="left: 797.953px; top: 1570px;"><div class="fam">柴田家</div><div class="name">柴田勝重</div><div class="role">勝政の子・勝家の養孫</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-azai" id="node-hisamasa" style="left: 1738.7px; top: 760px;"><div class="fam">浅井家</div><div class="name">浅井久政</div><div class="role">長政の父・浅井氏二代当主</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-other" id="node-ono_dono" style="left: 1576.52px; top: 760px;"><div class="fam">記録不詳</div><div class="name">小野殿</div><div class="role">浅井久政の妻・長政の母</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-azai" id="node-sukemasa" style="left: 1843.7px; top: 490px;"><div class="fam">浅井家</div><div class="name">浅井亮政</div><div class="role">長政の祖父・浅井氏初代当主</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-azai" id="node-kurayahime" style="left: 1633.7px; top: 490px;"><div class="fam">浅井家</div><div class="name">蔵屋</div><div class="role">浅井亮政の妻・浅井氏惣領家の娘</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-azai" id="node-naotane" style="left: 1843.7px; top: 220px;"><div class="fam">浅井家</div><div class="name">浅井直種</div><div class="role">長政の曾祖父・浅井氏庶流</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-shibata" id="node-katsuoki" style="left: 797.953px; top: 1840px;"><div class="fam">柴田家</div><div class="name">柴田勝興</div><div class="role">勝重の子(跡を継いだとみられる)</div><div class="pill" style="color:#9c5040">諸説・要検討</div></div><div class="node house-shibata" id="node-katsukado" style="left: 797.953px; top: 2110px;"><div class="fam">柴田家</div><div class="name">柴田勝門</div><div class="role">勝重の孫・三河へ移封した当主</div><div class="pill" style="color:#5c6b62">関係を確認</div></div><div class="node house-shibata" id="node-katsutomi" style="left: 797.953px; top: 2380px;"><div class="fam">柴田家</div><div class="name">柴田勝富</div><div class="role">勝門の子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata" id="node-katsusada" style="left: 772.453px; top: 2650px;"><div class="fam">柴田家</div><div class="name">柴田勝定</div><div class="role">勝富の子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata" id="node-katsuhiro" style="left: 797.953px; top: 2920px;"><div class="fam">柴田家</div><div class="name">柴田勝曠</div><div class="role">勝定の子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata" id="node-katsumitsu" style="left: 797.953px; top: 3190px;"><div class="fam">柴田家</div><div class="name">柴田勝満</div><div class="role">勝曠の子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-other" id="node-sakamoto_naoshizu" style="left: 938.453px; top: 2650px;"><div class="fam">記録不詳</div><div class="name">坂本直鎮</div><div class="role">勝富の子・坂本家へ養子</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div><div class="node house-shibata" id="node-katsufusa" style="left: 855.453px; top: 3460px;"><div class="fam">柴田家</div><div class="name">柴田勝房</div><div class="role">勝満の末期養子・第八代当主</div><div class="pill" style="color:#a4926a">系譜類に記載</div></div></div>
     </div>
     <div class="controls">
       <button id="editModeBtn" class="edit-toggle">編集モード</button>
@@ -226,15 +779,28 @@
       <button id="zoomOut">－</button>
       <button class="reset" id="resetView">全体</button>
     </div>
-    <div class="edit-panel" id="editPanel">
+    <div class="edit-panel" id="editPanel" style="display: none;">
       <p>編集モード中:カードをドラッグで移動、クリックで内容を編集できます。</p>
-      <label class="cascade-label"><input type="checkbox" id="cascadeChildren" checked> 子孫も一緒に動かす</label>
+      <label class="cascade-label"><input type="checkbox" id="cascadeChildren" checked=""> 子孫も一緒に動かす</label>
       <div class="edit-panel-buttons">
         <button id="addCardBtn">＋ 新しいカードを追加</button>
+        <button id="saveFileBtn" class="save-file">💾 ファイルを保存</button>
         <button id="copyPositionsBtn">変更をコピー</button>
         <button id="resetPositionsBtn">動かした位置をリセット</button>
       </div>
-      <textarea id="copyOutput" readonly></textarea>
+      <textarea id="copyOutput" readonly="" style="display: none;"></textarea>
+    </div>
+    <div class="save-overlay" id="saveOverlay">
+      <div class="save-overlay-box">
+        <h4>ファイルの保存</h4>
+        <p id="saveOverlayStatus"></p>
+        <p class="save-overlay-note">プレビュー画面ではダウンロードがブロックされる場合があります。その場合は下のボタンで全文をコピーし、テキストエディタに貼り付けて「.html」の拡張子で保存してください(すでにダウンロードできていれば、この操作は不要です)。</p>
+        <div class="save-overlay-buttons">
+          <button id="copyFullHtmlBtn">📋 ファイル全文をコピー</button>
+          <button id="saveOverlayClose">閉じる</button>
+        </div>
+        <textarea id="fullHtmlOutput" readonly=""></textarea>
+      </div>
     </div>
     <div class="edit-form" id="editForm">
       <button class="close" id="editFormClose">✕</button>
@@ -242,21 +808,21 @@
       <label>名前<input type="text" id="ef_name"></label>
       <label>肩書き・役割<input type="text" id="ef_role"></label>
       <label>よみ<input type="text" id="ef_yomi"></label>
-      <label>家<select id="ef_house"></select></label>
-      <label>確度<select id="ef_certainty"></select></label>
+      <label>家<select id="ef_house"><option value="shibata">柴田家</option><option value="oda">織田家</option><option value="azai">浅井家</option><option value="sakuma">佐久間家</option><option value="hineno">日根野家</option><option value="other">記録不詳</option></select></label>
+      <label>確度<select id="ef_certainty"><option value="confirmed">関係を確認</option><option value="genealogy">系譜類に記載</option><option value="uncertain">諸説・要検討</option><option value="unknown">氏名・出自不詳</option></select></label>
       <label class="ef_checkbox"><input type="checkbox" id="ef_unnamed"> 氏名不詳として表示(点線枠)</label>
       <label>説明文<textarea id="ef_note" rows="4"></textarea></label>
       <label>出典(1行に1つ)<textarea id="ef_sources" rows="2"></textarea></label>
       <div id="ef_relations" class="ef_relations">
         <p class="ef_relations_note">この人物の関係(いつでも設定・変更できます)</p>
-        <label>父<select id="ef_father"></select></label>
-        <label>母<select id="ef_mother"></select></label>
-        <label>配偶者<select id="ef_spouse"></select></label>
+        <label>父<select id="ef_father"><option value="">(なし)</option><option value="katsuie_father">伝・柴田勝義</option><option value="katsuie_mother">氏名不詳</option><option value="nobuhide">織田信秀</option><option value="oichi_mother">氏名不詳</option><option value="hineno_takayoshi">日根野高吉</option><option value="katsuie">柴田勝家</option><option value="oichi">お市の方</option><option value="nagamasa">浅井長政</option><option value="katsusato">柴田勝里</option><option value="katsutoyo">柴田勝豊</option><option value="katsumasa">柴田勝政</option><option value="katsumasa_wife">日根野高吉の娘</option><option value="katsutoshi">柴田勝敏</option><option value="katsuharu">柴田勝春</option><option value="katsuyuki">佐久間勝之</option><option value="adopted_daughter">氏名不詳の養女</option><option value="chacha">茶々(淀殿)</option><option value="hatsu">初(常高院)</option><option value="go">江(崇源院)</option><option value="katsushige">柴田勝重</option><option value="hisamasa">浅井久政</option><option value="ono_dono">小野殿</option><option value="sukemasa">浅井亮政</option><option value="kurayahime">蔵屋</option><option value="naotane">浅井直種</option><option value="katsuoki">柴田勝興</option><option value="katsukado">柴田勝門</option><option value="katsutomi">柴田勝富</option><option value="katsusada">柴田勝定</option><option value="katsuhiro">柴田勝曠</option><option value="katsumitsu">柴田勝満</option><option value="sakamoto_naoshizu">坂本直鎮</option><option value="katsufusa">柴田勝房</option></select></label>
+        <label>母<select id="ef_mother"><option value="">(なし)</option><option value="katsuie_father">伝・柴田勝義</option><option value="katsuie_mother">氏名不詳</option><option value="nobuhide">織田信秀</option><option value="oichi_mother">氏名不詳</option><option value="hineno_takayoshi">日根野高吉</option><option value="katsuie">柴田勝家</option><option value="oichi">お市の方</option><option value="nagamasa">浅井長政</option><option value="katsusato">柴田勝里</option><option value="katsutoyo">柴田勝豊</option><option value="katsumasa">柴田勝政</option><option value="katsumasa_wife">日根野高吉の娘</option><option value="katsutoshi">柴田勝敏</option><option value="katsuharu">柴田勝春</option><option value="katsuyuki">佐久間勝之</option><option value="adopted_daughter">氏名不詳の養女</option><option value="chacha">茶々(淀殿)</option><option value="hatsu">初(常高院)</option><option value="go">江(崇源院)</option><option value="katsushige">柴田勝重</option><option value="hisamasa">浅井久政</option><option value="ono_dono">小野殿</option><option value="sukemasa">浅井亮政</option><option value="kurayahime">蔵屋</option><option value="naotane">浅井直種</option><option value="katsuoki">柴田勝興</option><option value="katsukado">柴田勝門</option><option value="katsutomi">柴田勝富</option><option value="katsusada">柴田勝定</option><option value="katsuhiro">柴田勝曠</option><option value="katsumitsu">柴田勝満</option><option value="sakamoto_naoshizu">坂本直鎮</option><option value="katsufusa">柴田勝房</option></select></label>
+        <label>配偶者<select id="ef_spouse"><option value="">(なし)</option><option value="katsuie_father">伝・柴田勝義</option><option value="katsuie_mother">氏名不詳</option><option value="nobuhide">織田信秀</option><option value="oichi_mother">氏名不詳</option><option value="hineno_takayoshi">日根野高吉</option><option value="katsuie">柴田勝家</option><option value="oichi">お市の方</option><option value="nagamasa">浅井長政</option><option value="katsusato">柴田勝里</option><option value="katsutoyo">柴田勝豊</option><option value="katsumasa">柴田勝政</option><option value="katsumasa_wife">日根野高吉の娘</option><option value="katsutoshi">柴田勝敏</option><option value="katsuharu">柴田勝春</option><option value="katsuyuki">佐久間勝之</option><option value="adopted_daughter">氏名不詳の養女</option><option value="chacha">茶々(淀殿)</option><option value="hatsu">初(常高院)</option><option value="go">江(崇源院)</option><option value="katsushige">柴田勝重</option><option value="hisamasa">浅井久政</option><option value="ono_dono">小野殿</option><option value="sukemasa">浅井亮政</option><option value="kurayahime">蔵屋</option><option value="naotane">浅井直種</option><option value="katsuoki">柴田勝興</option><option value="katsukado">柴田勝門</option><option value="katsutomi">柴田勝富</option><option value="katsusada">柴田勝定</option><option value="katsuhiro">柴田勝曠</option><option value="katsumitsu">柴田勝満</option><option value="sakamoto_naoshizu">坂本直鎮</option><option value="katsufusa">柴田勝房</option></select></label>
       </div>
       <div class="edit-form-buttons">
         <button id="ef_save">保存</button>
         <button id="ef_resetOne">このカードをリセット</button>
-        <button id="ef_delete">🗑 このカードを削除</button>
+        <button id="ef_delete" style="display: inline-block;">🗑 このカードを削除</button>
       </div>
       <div class="ef_delete_confirm" id="ef_delete_confirm">
         <p>本当に削除しますか?この人物への関係線も削除されます(子孫は削除されず、切り離されます)。</p>
@@ -283,11 +849,354 @@
   <section class="list-section" id="listSection">
     <h3>人物一覧</h3>
     <p class="lead">系図が読み込めない環境でも内容を確認できるよう、同じ情報をここに一覧で載せています。氏名を押すと詳細が開きます。</p>
-    <div id="listContainer"></div>
+    <div id="listContainer"><details class="person house-shibata">
+      <summary>
+        <span class="dname">伝・柴田勝義</span>
+        <span class="drole">勝家の父とする説</span>
+      </summary>
+      <div class="body">
+        
+        <p>勝家の父を「柴田勝義」とする後世の系譜がありますが、確実な同時代史料では確認できません。名前を断定せず、説として表示します。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の系譜類、『張州府志』などの出生伝承</div>
+      </div>
+    </details><details class="person house-other">
+      <summary>
+        <span class="dname unnamed">氏名不詳</span>
+        <span class="drole">柴田勝家の母</span>
+      </summary>
+      <div class="body">
+        
+        <p>勝家の母は、氏名も出自も判明していません。空欄にはせず、「記録からこぼれ落ちた人物」として系図上に残します。</p>
+        <div class="src"><strong>根拠・参照:</strong> 現時点で確実な系譜史料を確認できず</div>
+      </div>
+    </details><details class="person house-oda">
+      <summary>
+        <span class="dname">織田信秀</span>
+        <span class="drole">お市の父</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">おだ のぶひで</div>
+        <p>尾張の戦国大名。お市は信秀の娘で、織田信長の妹とするのが通説です。</p>
+        <div class="src"><strong>根拠・参照:</strong> お市関係の諸史料・研究書</div>
+      </div>
+    </details><details class="person house-other">
+      <summary>
+        <span class="dname unnamed">氏名不詳</span>
+        <span class="drole">お市の母</span>
+      </summary>
+      <div class="body">
+        
+        <p>お市の母は確定していません。土田御前とする系図・通説もありますが、史料上は断定できないため、母を存在ごと消さず「氏名不詳」と表示します(土田御前説あり)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 黒田基樹『お市の方の生涯』、後世の織田氏系譜</div>
+      </div>
+    </details><details class="person house-hineno">
+      <summary>
+        <span class="dname">日根野高吉</span>
+        <span class="drole">勝重の母方祖父</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">ひねの たかよし</div>
+        <p>勝政の子・勝重が幼くして北庄を脱出した後、母方の祖父である日根野高吉に引き取られたと『寛政重修諸家譜』などが伝えます。母方の縁が柴田家の系譜を次代へつないだ重要人物です。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『寛政重修諸家譜』、『系図続覧』柴田系図</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝家</span>
+        <span class="drole">越前北庄城主</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かついえ</div>
+        <p>織田信長の重臣。お市と天正10年(1582)に婚姻しました。実子とされる人物の記録は後世の系譜に依存する一方、複数の養子を迎えたことが伝わります(大永2年〈1522〉頃-天正11年〈1583〉)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『信長公記』ほか、『寛政重修諸家譜』、『系図続覧』</div>
+      </div>
+    </details><details class="person house-oda">
+      <summary>
+        <span class="dname">お市の方</span>
+        <span class="drole">勝家の妻・浅井三姉妹の母</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">おいちのかた</div>
+        <p>織田信長の妹。浅井長政との間に茶々・初・江をもうけ、長政の没後、柴田勝家と再婚しました。勝家との間の実子は確認されていません(天正10年〈1582〉に勝家と婚姻)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 黒田基樹『お市の方の生涯』、長浜市「江をめぐる人物関係図」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">浅井長政</span>
+        <span class="drole">お市の前夫・三姉妹の父</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">あざい ながまさ</div>
+        <p>北近江の戦国大名。お市の最初の夫で、茶々・初・江の実父です。三姉妹と柴田勝家の関係を正確に示すため、前夫も同じ画面に置いています。</p>
+        <div class="src"><strong>根拠・参照:</strong> 長浜市「江をめぐる人物関係図」、浅井氏関係史料</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝里</span>
+        <span class="drole">実子とする後世の系譜</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつさと</div>
+        <p>勝家の庶子とする記載が尾張藩士の系図集などに見られます。ただし、同時代史料による裏付けには限界があります。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『士林泝洄』など後世の系譜</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝忠</span>
+        <span class="drole">実子とする後世の系譜</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつただ</div>
+        <p>勝家の庶子とする後世の系譜があります。毛受氏に養育されたという伝承もありますが、母の名を含め確定できない点が多く残ります。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の柴田氏・毛受氏系譜</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝豊</span>
+        <span class="drole">養子・勝家の甥</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつとよ</div>
+        <p>勝家の姉(氏名不詳)と吉田次兵衛の子で、勝家の養子になったとされます。母の名は伝わりませんが、母方をたどることで勝家の甥であることが見えてきます(母:勝家の姉〈氏名不詳〉)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の柴田氏系譜、昼間たかし「柴田勝家の子孫」取材原稿</div>
+      </div>
+    </details><details class="person house-sakuma">
+      <summary>
+        <span class="dname">柴田勝政</span>
+        <span class="drole">養子・佐久間盛次の子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつまさ</div>
+        <p>佐久間盛次の子で、勝家の養子。盛次は勝家の姉婿とされるため、勝政は勝家の甥にあたります。賤ヶ岳の戦いで討死しました(母:勝家の姉〈氏名不詳〉)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『寛政重修諸家譜』、『系図続覧』柴田系図</div>
+      </div>
+    </details><details class="person house-hineno">
+      <summary>
+        <span class="dname unnamed">日根野高吉の娘</span>
+        <span class="drole">勝政の妻・勝重の母</span>
+      </summary>
+      <div class="body">
+        
+        <p>個人名は伝わっていませんが、勝政の妻で勝重の母。幼い勝重が母方の祖父・日根野高吉に保護されたという系譜から、その存在と母方のつながりが浮かびます。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『寛政重修諸家譜』、『系図続覧』柴田系図</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝敏</span>
+        <span class="drole">養子とする系譜</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつとし</div>
+        <p>勝家の養子、甥、または実子とする異なる伝承があります。関係を一つに固定せず、「養子とする系譜がある」人物として表示します。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の柴田氏系譜(続柄に諸説)</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝春</span>
+        <span class="drole">養子とする系譜</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつはる</div>
+        <p>勝家の庶兄の子で養子になったとする後世の系譜があります。人物関係を確定できる史料が乏しいため、留保を付けています。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の柴田氏系譜</div>
+      </div>
+    </details><details class="person house-sakuma">
+      <summary>
+        <span class="dname">佐久間勝之</span>
+        <span class="drole">養子とする系譜</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">さくま かつゆき</div>
+        <p>佐久間盛次の子。勝家の養子、のち佐々成政の養子になったとする系譜があります。養子縁組の経緯には不明点が残ります。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の佐久間氏・柴田氏系譜</div>
+      </div>
+    </details><details class="person house-other">
+      <summary>
+        <span class="dname unnamed">氏名不詳の養女</span>
+        <span class="drole">高城胤則の妻</span>
+      </summary>
+      <div class="body">
+        
+        <p>高城胤則の妻となった養女を記す後世の系譜があります。男性の養子だけでなく、名が残らなかった養女も同じ一人の人物として表示します(実父を中村某とする系譜あり)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 後世の柴田氏系譜</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">茶々(淀殿)</span>
+        <span class="drole">お市の長女・勝家の継娘</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">ちゃちゃ</div>
+        <p>浅井長政とお市の長女。勝家とは血縁上の親子ではなく、お市との婚姻による継父・継娘の関係です。</p>
+        <div class="src"><strong>根拠・参照:</strong> 長浜市「江をめぐる人物関係図」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">初(常高院)</span>
+        <span class="drole">お市の次女・勝家の継娘</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">はつ</div>
+        <p>浅井長政とお市の次女。のち京極高次の正室となりました。系図では勝家の養女と断定せず、継娘として区別します。</p>
+        <div class="src"><strong>根拠・参照:</strong> 長浜市「江をめぐる人物関係図」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">江(崇源院)</span>
+        <span class="drole">お市の三女・勝家の継娘</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">ごう</div>
+        <p>浅井長政とお市の三女。のち徳川秀忠の正室となりました。母・お市を起点に、織田・浅井・柴田・徳川の各家がつながります。</p>
+        <div class="src"><strong>根拠・参照:</strong> 長浜市「江をめぐる人物関係図」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝重</span>
+        <span class="drole">勝政の子・勝家の養孫</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつしげ</div>
+        <p>勝政の子。幼少時に北庄から逃れ、母方祖父・日根野高吉に育てられました。のち徳川家康に召し出され、柴田家の系譜を江戸時代へつなぎました(母方の保護で生き延びた系譜)。</p>
+        <div class="src"><strong>根拠・参照:</strong> 『寛政重修諸家譜』、『系図続覧』柴田系図</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">浅井久政</span>
+        <span class="drole">長政の父・浅井氏二代当主</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">あざい ひさまさ</div>
+        <p>浅井亮政の子。六角氏に押されて従属的な立場に置かれ、当主としては弱腰と評されることが多い。家臣団の意向で隠居に追い込まれ長政に家督を譲った後も、一定の発言力を保ったとされる。小谷城落城の際に長政と運命を共にした。</p>
+        <div class="src"><strong>根拠・参照:</strong> 刀剣ワールド「浅井長政の歴史」、レキシル「浅井長政の子孫は現在も続く」</div>
+      </div>
+    </details><details class="person house-other">
+      <summary>
+        <span class="dname">小野殿</span>
+        <span class="drole">浅井久政の妻・長政の母</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">おのどの</div>
+        <p>浅井久政の妻で、長政の生母とされる。「小野殿」は居所などに由来する呼称とみられ、実家の出自を確定する史料には乏しい。</p>
+        <div class="src"><strong>根拠・参照:</strong> ホームメイト「浅井長政」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">浅井亮政</span>
+        <span class="drole">長政の祖父・浅井氏初代当主</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">あざい すけまさ</div>
+        <p>浅井氏庶流(蔵人家)・直種の子。惣領家当主直政に男子がなかったため、その娘蔵屋と結婚して浅井氏本流の家督を継承した。京極氏の内紛に乗じて北近江を統一し、戦国大名浅井氏の基礎を築く。小谷城を築城。</p>
+        <div class="src"><strong>根拠・参照:</strong> コトバンク「浅井亮政」、戦国ヒストリー「浅井長政の家系図」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">蔵屋</span>
+        <span class="drole">浅井亮政の妻・浅井氏惣領家の娘</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">くらや</div>
+        <p>浅井氏惣領家当主・直政の娘で、亮政の妻。亮政はこの婚姻によって浅井氏本流の家督を継いだ。史料によっては亮政のもう一人の妻(尼子氏の娘)も伝わっており、久政の生母がどちらであるかは確定していない。</p>
+        <div class="src"><strong>根拠・参照:</strong> Weblio「浅井亮政」、harimaya.com「近江浅井氏・浅井亮政」</div>
+      </div>
+    </details><details class="person house-azai">
+      <summary>
+        <span class="dname">浅井直種</span>
+        <span class="drole">長政の曾祖父・浅井氏庶流</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">あざい なおたね</div>
+        <p>浅井氏庶流(蔵人家)の当主。北近江の守護・京極氏に仕えた国人で、子の亮政が惣領家を継いだことで、その血筋が浅井氏本流に連なることになった。同時代史料への言及は乏しく、亮政の父とする推定は状況証拠によるところが大きい。</p>
+        <div class="src"><strong>根拠・参照:</strong> 戦国ヒストリー「浅井長政の家系図」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝興</span>
+        <span class="drole">勝重の子(跡を継いだとみられる)</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつおき</div>
+        <p>柴田勝重の子。史料に伝わる勝重の子(勝興・三浦信勝・勝平・勝昌など)のうち最初に挙げられることが多く、家督を継いだ人物とみられる。ただし後継の勝門との続柄を明記した一次史料は確認できておらず、推定にとどまる。</p>
+        <div class="src"><strong>根拠・参照:</strong> 日本通信百科事典「柴田勝重」、Webcat Plus「柴田勝重」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝門</span>
+        <span class="drole">勝重の孫・三河へ移封した当主</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつかど</div>
+        <p>9歳で徳川家綱に拝謁し、父の隠居に伴い家督を継承。日光造営の功により従五位下・越前守に叙任された。のち関東(武蔵・上野)にあった3520石の知行地を三河国額田郡・宝飯郡に移され、本宿村(現・愛知県岡崎市本宿町)に陣屋を置いた。以後、旗本柴田家は幕末までこの地の領主となる。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」、『寛政重修諸家譜』巻第三百七十二</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝富</span>
+        <span class="drole">勝門の子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつとみ</div>
+        <p>勝門の跡を継いだ当主。子に坂本家へ養子に出た直鎮、家を継いだ勝定がいる。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝定</span>
+        <span class="drole">勝富の子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつさだ</div>
+        <p>勝富の跡を継いだ当主。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝曠</span>
+        <span class="drole">勝定の子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつひろ</div>
+        <p>勝定の跡を継いだ当主。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝満</span>
+        <span class="drole">勝曠の子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつみつ</div>
+        <p>勝曠の跡を継いだ当主。実子に恵まれず、末期養子として柴田勝房を迎えて家を継がせた。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」</div>
+      </div>
+    </details><details class="person house-other">
+      <summary>
+        <span class="dname">坂本直鎮</span>
+        <span class="drole">勝富の子・坂本家へ養子</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">さかもと なおしず</div>
+        <p>柴田勝富の子として生まれたが、坂本家の養子となり坂本姓を名乗った。血統としては柴田家の一員だが、家名は坂本家を継いだ。子の勝房は再び柴田家へ戻ることになる。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」</div>
+      </div>
+    </details><details class="person house-shibata">
+      <summary>
+        <span class="dname">柴田勝房</span>
+        <span class="drole">勝満の末期養子・第八代当主</span>
+      </summary>
+      <div class="body">
+        <div class="yomi">しばた かつふさ</div>
+        <p>坂本直鎮の子。柴田家宗家の血筋にあたることから、跡継ぎのなかった勝満の末期養子として柴田家を継いだ(勝重を初代とすれば第8代当主)。家祖勝重の墓所である春清寺に柴田勝家の位牌を新たに奉納し、勝家・勝政・勝重3代の事績を記した文書(「柴田家先祖書」)を添えた。のち同寺に「柴田家家碑」を建立している。この後、柴田家は勝全(幕末当主)・勝誠(明治初年の最後の当主)へと続き、明治2年(1869)に知行地を明治政府(静岡藩)へ上知した。</p>
+        <div class="src"><strong>根拠・参照:</strong> Wikipedia「柴田勝門」、フォートラベル「柴田勝重の墓」クチコミ</div>
+      </div>
+    </details></div>
   </section>
 </div>
 
 <script>
+/* 「ファイルを保存」機能のために、このスクリプト自身の元のソースコードを控えておく。
+   (実行中のJSの変数の値ではなく、あくまでこのタグに書かれた「文字列としてのコード」を保持する) */
+const ORIGINAL_SCRIPT_SOURCE = document.currentScript.textContent;
 /* =========================================================================
    データ構造(座標指定は不要。追加した人物と関係から自動的に配置されます):
 
@@ -306,117 +1215,56 @@
       x, y 座標は auto layout エンジンが自動計算します。
    ========================================================================= */
 const nodes = [
-  {id:"katsuie_father",  name:"伝・柴田勝義", house:"shibata", role:"勝家の父とする説",
-    certainty:"uncertain", note:"勝家の父を「柴田勝義」とする後世の系譜がありますが、確実な同時代史料では確認できません。名前を断定せず、説として表示します。",
-    sources:["後世の系譜類","『張州府志』などの出生伝承"]},
-  {id:"katsuie_mother",  name:"氏名不詳", house:"other", unnamed:true, role:"柴田勝家の母",
-    certainty:"unknown", note:"勝家の母は、氏名も出自も判明していません。空欄にはせず、「記録からこぼれ落ちた人物」として系図上に残します。",
-    sources:["現時点で確実な系譜史料を確認できず"]},
-  {id:"nobuhide", name:"織田信秀", house:"oda", role:"お市の父", yomi:"おだ のぶひで",
-    certainty:"confirmed", note:"尾張の戦国大名。お市は信秀の娘で、織田信長の妹とするのが通説です。",
-    sources:["お市関係の諸史料・研究書"]},
-  {id:"oichi_mother", name:"氏名不詳", house:"other", unnamed:true, role:"お市の母",
-    certainty:"uncertain", note:"お市の母は確定していません。土田御前とする系図・通説もありますが、史料上は断定できないため、母を存在ごと消さず「氏名不詳」と表示します(土田御前説あり)。",
-    sources:["黒田基樹『お市の方の生涯』","後世の織田氏系譜"]},
-  {id:"hineno_takayoshi", name:"日根野高吉", house:"hineno", role:"勝重の母方祖父", yomi:"ひねの たかよし",
-    certainty:"genealogy", note:"勝政の子・勝重が幼くして北庄を脱出した後、母方の祖父である日根野高吉に引き取られたと『寛政重修諸家譜』などが伝えます。母方の縁が柴田家の系譜を次代へつないだ重要人物です。",
-    sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
-  {id:"katsuie", name:"柴田勝家", house:"shibata", role:"越前北庄城主", yomi:"しばた かついえ", trunk:true,
-    certainty:"confirmed", note:"織田信長の重臣。お市と天正10年(1582)に婚姻しました。実子とされる人物の記録は後世の系譜に依存する一方、複数の養子を迎えたことが伝わります(大永2年〈1522〉頃-天正11年〈1583〉)。",
-    sources:["『信長公記』ほか","『寛政重修諸家譜』","『系図続覧』"]},
-  {id:"oichi", name:"お市の方", house:"oda", role:"勝家の妻・浅井三姉妹の母", yomi:"おいちのかた",
-    certainty:"confirmed", note:"織田信長の妹。浅井長政との間に茶々・初・江をもうけ、長政の没後、柴田勝家と再婚しました。勝家との間の実子は確認されていません(天正10年〈1582〉に勝家と婚姻)。",
-    sources:["黒田基樹『お市の方の生涯』","長浜市「江をめぐる人物関係図」"]},
-  {id:"nagamasa", name:"浅井長政", house:"azai", role:"お市の前夫・三姉妹の父", yomi:"あざい ながまさ",
-    certainty:"confirmed", note:"北近江の戦国大名。お市の最初の夫で、茶々・初・江の実父です。三姉妹と柴田勝家の関係を正確に示すため、前夫も同じ画面に置いています。",
-    sources:["長浜市「江をめぐる人物関係図」","浅井氏関係史料"]},
-  {id:"katsusato", name:"柴田勝里", house:"shibata", role:"実子とする後世の系譜", yomi:"しばた かつさと",
-    certainty:"genealogy", note:"勝家の庶子とする記載が尾張藩士の系図集などに見られます。ただし、同時代史料による裏付けには限界があります。",
-    sources:["『士林泝洄』など後世の系譜"]},
-  {id:"katsutada", name:"柴田勝忠", house:"shibata", role:"実子とする後世の系譜", yomi:"しばた かつただ",
-    certainty:"genealogy", note:"勝家の庶子とする後世の系譜があります。毛受氏に養育されたという伝承もありますが、母の名を含め確定できない点が多く残ります。",
-    sources:["後世の柴田氏・毛受氏系譜"]},
-  {id:"katsutoyo", name:"柴田勝豊", house:"shibata", role:"養子・勝家の甥", yomi:"しばた かつとよ",
-    certainty:"genealogy", note:"勝家の姉(氏名不詳)と吉田次兵衛の子で、勝家の養子になったとされます。母の名は伝わりませんが、母方をたどることで勝家の甥であることが見えてきます(母:勝家の姉〈氏名不詳〉)。",
-    sources:["後世の柴田氏系譜","昼間たかし「柴田勝家の子孫」取材原稿"]},
-  {id:"katsumasa", name:"柴田勝政", house:"sakuma", role:"養子・佐久間盛次の子", yomi:"しばた かつまさ",
-    certainty:"genealogy", note:"佐久間盛次の子で、勝家の養子。盛次は勝家の姉婿とされるため、勝政は勝家の甥にあたります。賤ヶ岳の戦いで討死しました(母:勝家の姉〈氏名不詳〉)。",
-    sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
-  {id:"katsumasa_wife", name:"日根野高吉の娘", house:"hineno", unnamed:true, role:"勝政の妻・勝重の母",
-    certainty:"genealogy", note:"個人名は伝わっていませんが、勝政の妻で勝重の母。幼い勝重が母方の祖父・日根野高吉に保護されたという系譜から、その存在と母方のつながりが浮かびます。",
-    sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
-  {id:"katsutoshi", name:"柴田勝敏", house:"shibata", role:"養子とする系譜", yomi:"しばた かつとし",
-    certainty:"uncertain", note:"勝家の養子、甥、または実子とする異なる伝承があります。関係を一つに固定せず、「養子とする系譜がある」人物として表示します。",
-    sources:["後世の柴田氏系譜(続柄に諸説)"]},
-  {id:"katsuharu", name:"柴田勝春", house:"shibata", role:"養子とする系譜", yomi:"しばた かつはる",
-    certainty:"uncertain", note:"勝家の庶兄の子で養子になったとする後世の系譜があります。人物関係を確定できる史料が乏しいため、留保を付けています。",
-    sources:["後世の柴田氏系譜"]},
-  {id:"katsuyuki", name:"佐久間勝之", house:"sakuma", role:"養子とする系譜", yomi:"さくま かつゆき",
-    certainty:"uncertain", note:"佐久間盛次の子。勝家の養子、のち佐々成政の養子になったとする系譜があります。養子縁組の経緯には不明点が残ります。",
-    sources:["後世の佐久間氏・柴田氏系譜"]},
-  {id:"adopted_daughter", name:"氏名不詳の養女", house:"other", unnamed:true, role:"高城胤則の妻",
-    certainty:"uncertain", note:"高城胤則の妻となった養女を記す後世の系譜があります。男性の養子だけでなく、名が残らなかった養女も同じ一人の人物として表示します(実父を中村某とする系譜あり)。",
-    sources:["後世の柴田氏系譜"]},
-  {id:"chacha", name:"茶々(淀殿)", house:"azai", role:"お市の長女・勝家の継娘", yomi:"ちゃちゃ",
-    certainty:"confirmed", note:"浅井長政とお市の長女。勝家とは血縁上の親子ではなく、お市との婚姻による継父・継娘の関係です。",
-    sources:["長浜市「江をめぐる人物関係図」"]},
-  {id:"hatsu", name:"初(常高院)", house:"azai", role:"お市の次女・勝家の継娘", yomi:"はつ",
-    certainty:"confirmed", note:"浅井長政とお市の次女。のち京極高次の正室となりました。系図では勝家の養女と断定せず、継娘として区別します。",
-    sources:["長浜市「江をめぐる人物関係図」"]},
-  {id:"go", name:"江(崇源院)", house:"azai", role:"お市の三女・勝家の継娘", yomi:"ごう",
-    certainty:"confirmed", note:"浅井長政とお市の三女。のち徳川秀忠の正室となりました。母・お市を起点に、織田・浅井・柴田・徳川の各家がつながります。",
-    sources:["長浜市「江をめぐる人物関係図」"]},
-  {id:"katsushige", name:"柴田勝重", house:"shibata", role:"勝政の子・勝家の養孫", yomi:"しばた かつしげ",
-    certainty:"genealogy", note:"勝政の子。幼少時に北庄から逃れ、母方祖父・日根野高吉に育てられました。のち徳川家康に召し出され、柴田家の系譜を江戸時代へつなぎました(母方の保護で生き延びた系譜)。",
-    sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
-
-  // ---- 浅井長政の先祖(3世代) ----
-  {id:"hisamasa", name:"浅井久政", house:"azai", role:"長政の父・浅井氏二代当主", yomi:"あざい ひさまさ",
-    certainty:"confirmed", note:"浅井亮政の子。六角氏に押されて従属的な立場に置かれ、当主としては弱腰と評されることが多い。家臣団の意向で隠居に追い込まれ長政に家督を譲った後も、一定の発言力を保ったとされる。小谷城落城の際に長政と運命を共にした。",
-    sources:["刀剣ワールド「浅井長政の歴史」","レキシル「浅井長政の子孫は現在も続く」"]},
-  {id:"ono_dono", name:"小野殿", house:"other", role:"浅井久政の妻・長政の母", yomi:"おのどの",
-    certainty:"confirmed", note:"浅井久政の妻で、長政の生母とされる。「小野殿」は居所などに由来する呼称とみられ、実家の出自を確定する史料には乏しい。",
-    sources:["ホームメイト「浅井長政」"]},
-  {id:"sukemasa", name:"浅井亮政", house:"azai", role:"長政の祖父・浅井氏初代当主", yomi:"あざい すけまさ",
-    certainty:"confirmed", note:"浅井氏庶流(蔵人家)・直種の子。惣領家当主直政に男子がなかったため、その娘蔵屋と結婚して浅井氏本流の家督を継承した。京極氏の内紛に乗じて北近江を統一し、戦国大名浅井氏の基礎を築く。小谷城を築城。",
-    sources:["コトバンク「浅井亮政」","戦国ヒストリー「浅井長政の家系図」"]},
-  {id:"kurayahime", name:"蔵屋", house:"azai", role:"浅井亮政の妻・浅井氏惣領家の娘", yomi:"くらや",
-    certainty:"uncertain", note:"浅井氏惣領家当主・直政の娘で、亮政の妻。亮政はこの婚姻によって浅井氏本流の家督を継いだ。史料によっては亮政のもう一人の妻(尼子氏の娘)も伝わっており、久政の生母がどちらであるかは確定していない。",
-    sources:["Weblio「浅井亮政」","harimaya.com「近江浅井氏・浅井亮政」"]},
-  {id:"naotane", name:"浅井直種", house:"azai", role:"長政の曾祖父・浅井氏庶流", yomi:"あざい なおたね",
-    certainty:"uncertain", note:"浅井氏庶流(蔵人家)の当主。北近江の守護・京極氏に仕えた国人で、子の亮政が惣領家を継いだことで、その血筋が浅井氏本流に連なることになった。同時代史料への言及は乏しく、亮政の父とする推定は状況証拠によるところが大きい。",
-    sources:["戦国ヒストリー「浅井長政の家系図」"]},
-
-  // ---- 柴田勝重の子孫(旗本柴田家) ----
-  {id:"katsuoki", name:"柴田勝興", house:"shibata", role:"勝重の子(跡を継いだとみられる)", yomi:"しばた かつおき",
-    certainty:"uncertain", note:"柴田勝重の子。史料に伝わる勝重の子(勝興・三浦信勝・勝平・勝昌など)のうち最初に挙げられることが多く、家督を継いだ人物とみられる。ただし後継の勝門との続柄を明記した一次史料は確認できておらず、推定にとどまる。",
-    sources:["日本通信百科事典「柴田勝重」","Webcat Plus「柴田勝重」"]},
-  {id:"katsukado", name:"柴田勝門", house:"shibata", role:"勝重の孫・三河へ移封した当主", yomi:"しばた かつかど",
-    certainty:"confirmed", note:"9歳で徳川家綱に拝謁し、父の隠居に伴い家督を継承。日光造営の功により従五位下・越前守に叙任された。のち関東(武蔵・上野)にあった3520石の知行地を三河国額田郡・宝飯郡に移され、本宿村(現・愛知県岡崎市本宿町)に陣屋を置いた。以後、旗本柴田家は幕末までこの地の領主となる。",
-    sources:["Wikipedia「柴田勝門」","『寛政重修諸家譜』巻第三百七十二"]},
-  {id:"katsutomi", name:"柴田勝富", house:"shibata", role:"勝門の子", yomi:"しばた かつとみ",
-    certainty:"genealogy", note:"勝門の跡を継いだ当主。子に坂本家へ養子に出た直鎮、家を継いだ勝定がいる。",
-    sources:["Wikipedia「柴田勝門」"]},
-  {id:"katsusada", name:"柴田勝定", house:"shibata", role:"勝富の子", yomi:"しばた かつさだ",
-    certainty:"genealogy", note:"勝富の跡を継いだ当主。",
-    sources:["Wikipedia「柴田勝門」"]},
-  {id:"katsuhiro", name:"柴田勝曠", house:"shibata", role:"勝定の子", yomi:"しばた かつひろ",
-    certainty:"genealogy", note:"勝定の跡を継いだ当主。",
-    sources:["Wikipedia「柴田勝門」"]},
-  {id:"katsumitsu", name:"柴田勝満", house:"shibata", role:"勝曠の子", yomi:"しばた かつみつ",
-    certainty:"genealogy", note:"勝曠の跡を継いだ当主。実子に恵まれず、末期養子として柴田勝房を迎えて家を継がせた。",
-    sources:["Wikipedia「柴田勝門」"]},
-  {id:"sakamoto_naoshizu", name:"坂本直鎮", house:"other", role:"勝富の子・坂本家へ養子", yomi:"さかもと なおしず",
-    certainty:"genealogy", note:"柴田勝富の子として生まれたが、坂本家の養子となり坂本姓を名乗った。血統としては柴田家の一員だが、家名は坂本家を継いだ。子の勝房は再び柴田家へ戻ることになる。",
-    sources:["Wikipedia「柴田勝門」"]},
-  {id:"katsufusa", name:"柴田勝房", house:"shibata", role:"勝満の末期養子・第八代当主", yomi:"しばた かつふさ",
-    certainty:"genealogy", note:"坂本直鎮の子。柴田家宗家の血筋にあたることから、跡継ぎのなかった勝満の末期養子として柴田家を継いだ(勝重を初代とすれば第8代当主)。家祖勝重の墓所である春清寺に柴田勝家の位牌を新たに奉納し、勝家・勝政・勝重3代の事績を記した文書(「柴田家先祖書」)を添えた。のち同寺に「柴田家家碑」を建立している。この後、柴田家は勝全(幕末当主)・勝誠(明治初年の最後の当主)へと続き、明治2年(1869)に知行地を明治政府(静岡藩)へ上知した。",
-    sources:["Wikipedia「柴田勝門」","フォートラベル「柴田勝重の墓」クチコミ"]},
+  {id:"katsuie_father", name:"伝・柴田勝義", house:"shibata", role:"勝家の父とする説", certainty:"uncertain", note:"勝家の父を「柴田勝義」とする後世の系譜がありますが、確実な同時代史料では確認できません。名前を断定せず、説として表示します。", sources:["後世の系譜類","『張州府志』などの出生伝承"]},
+  {id:"katsuie_mother", name:"氏名不詳", house:"other", unnamed:true, role:"柴田勝家の母", certainty:"unknown", note:"勝家の母は、氏名も出自も判明していません。空欄にはせず、「記録からこぼれ落ちた人物」として系図上に残します。", sources:["現時点で確実な系譜史料を確認できず"]},
+  {id:"nobuhide", name:"織田信秀", house:"oda", role:"お市の父", yomi:"おだ のぶひで", certainty:"confirmed", note:"尾張の戦国大名。お市は信秀の娘で、織田信長の妹とするのが通説です。", sources:["お市関係の諸史料・研究書"]},
+  {id:"oichi_mother", name:"氏名不詳", house:"other", unnamed:true, role:"お市の母", certainty:"uncertain", note:"お市の母は確定していません。土田御前とする系図・通説もありますが、史料上は断定できないため、母を存在ごと消さず「氏名不詳」と表示します(土田御前説あり)。", sources:["黒田基樹『お市の方の生涯』","後世の織田氏系譜"]},
+  {id:"hineno_takayoshi", name:"日根野高吉", house:"hineno", role:"勝重の母方祖父", yomi:"ひねの たかよし", certainty:"genealogy", note:"勝政の子・勝重が幼くして北庄を脱出した後、母方の祖父である日根野高吉に引き取られたと『寛政重修諸家譜』などが伝えます。母方の縁が柴田家の系譜を次代へつないだ重要人物です。", sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
+  {id:"katsuie", name:"柴田勝家", house:"shibata", role:"越前北庄城主", yomi:"しばた かついえ", trunk:true, protagonist:true, certainty:"confirmed", note:"織田信長の重臣。お市と天正10年(1582)に婚姻しました。実子とされる人物の記録は後世の系譜に依存する一方、複数の養子を迎えたことが伝わります(大永2年〈1522〉頃-天正11年〈1583〉)。", sources:["『信長公記』ほか","『寛政重修諸家譜』","『系図続覧』"]},
+  {id:"oichi", name:"お市の方", house:"oda", role:"勝家の妻・浅井三姉妹の母", yomi:"おいちのかた", certainty:"confirmed", note:"織田信長の妹。浅井長政との間に茶々・初・江をもうけ、長政の没後、柴田勝家と再婚しました。勝家との間の実子は確認されていません(天正10年〈1582〉に勝家と婚姻)。", sources:["黒田基樹『お市の方の生涯』","長浜市「江をめぐる人物関係図」"]},
+  {id:"nagamasa", name:"浅井長政", house:"azai", role:"お市の前夫・三姉妹の父", yomi:"あざい ながまさ", certainty:"confirmed", note:"北近江の戦国大名。お市の最初の夫で、茶々・初・江の実父です。三姉妹と柴田勝家の関係を正確に示すため、前夫も同じ画面に置いています。", sources:["長浜市「江をめぐる人物関係図」","浅井氏関係史料"]},
+  {id:"katsusato", name:"柴田勝里", house:"shibata", role:"実子とする後世の系譜", yomi:"しばた かつさと", certainty:"genealogy", note:"勝家の庶子とする記載が尾張藩士の系図集などに見られます。ただし、同時代史料による裏付けには限界があります。", sources:["『士林泝洄』など後世の系譜"]},
+  {id:"katsutada", name:"柴田勝忠", house:"shibata", role:"実子とする後世の系譜", yomi:"しばた かつただ", certainty:"genealogy", note:"勝家の庶子とする後世の系譜があります。毛受氏に養育されたという伝承もありますが、母の名を含め確定できない点が多く残ります。", sources:["後世の柴田氏・毛受氏系譜"], unnamed:false},
+  {id:"katsuie_sister", name:"氏名不詳", house:"shibata", unnamed:true, role:"勝家の姉・勝豊/勝政/勝之の母", certainty:"genealogy", note:"柴田勝家の姉で、勝豊・勝政・佐久間勝之の母にあたるとされる人物。個人名は伝わっていませんが、複数の養子の系譜に「勝家の姉」として現れるため、独立した人物として表示します。最初の夫との死別・離別後、佐久間盛次と再婚したとする伝承があります。", sources:["後世の柴田氏系譜","昼間たかし「柴田勝家の子孫」取材原稿"]},
+  {id:"yoshida_jihyoe", name:"吉田次兵衛", house:"other", role:"勝家の姉の最初の夫・勝豊の父", yomi:"よしだ じへえ", certainty:"genealogy", note:"柴田勝家の姉の最初の夫とされ、柴田勝豊の実父にあたります。系譜以外での事績はほとんど伝わっていません。", sources:["後世の柴田氏系譜","昼間たかし「柴田勝家の子孫」取材原稿"]},
+  {id:"sakuma_moritsugu", name:"佐久間盛次", house:"sakuma", role:"勝家の姉婿・勝政/勝之の父", yomi:"さくま もりつぐ", certainty:"genealogy", note:"柴田勝家の姉を妻に迎えたとされる人物で、柴田勝政・佐久間勝之(のち佐々成政の養子)らの実父。両名が勝家の甥として養子に入った背景にあたります。", sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
+  {id:"katsutoyo", name:"柴田勝豊", house:"shibata", role:"養子・勝家の甥", yomi:"しばた かつとよ", certainty:"genealogy", note:"勝家の姉(氏名不詳)と吉田次兵衛の子で、勝家の養子になったとされます。母の名は伝わりませんが、母方をたどることで勝家の甥であることが見えてきます(母:勝家の姉〈氏名不詳〉)。", sources:["後世の柴田氏系譜","昼間たかし「柴田勝家の子孫」取材原稿"]},
+  {id:"katsumasa", name:"柴田勝政", house:"sakuma", role:"養子・佐久間盛次の子", yomi:"しばた かつまさ", certainty:"genealogy", note:"佐久間盛次の子で、勝家の養子。盛次は勝家の姉婿とされるため、勝政は勝家の甥にあたります。賤ヶ岳の戦いで討死しました(母:勝家の姉〈氏名不詳〉)。", sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
+  {id:"katsumasa_wife", name:"日根野高吉の娘", house:"hineno", unnamed:true, role:"勝政の妻・勝重の母", certainty:"genealogy", note:"個人名は伝わっていませんが、勝政の妻で勝重の母。幼い勝重が母方の祖父・日根野高吉に保護されたという系譜から、その存在と母方のつながりが浮かびます。", sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
+  {id:"katsutoshi", name:"柴田勝敏", house:"shibata", role:"養子とする系譜", yomi:"しばた かつとし", certainty:"uncertain", note:"勝家の養子、甥、または実子とする異なる伝承があります。関係を一つに固定せず、「養子とする系譜がある」人物として表示します。", sources:["後世の柴田氏系譜(続柄に諸説)"]},
+  {id:"katsuharu", name:"柴田勝春", house:"shibata", role:"養子とする系譜", yomi:"しばた かつはる", certainty:"uncertain", note:"勝家の庶兄の子で養子になったとする後世の系譜があります。人物関係を確定できる史料が乏しいため、留保を付けています。", sources:["後世の柴田氏系譜"]},
+  {id:"katsuyuki", name:"佐久間勝之", house:"sakuma", role:"養子とする系譜", yomi:"さくま かつゆき", certainty:"uncertain", note:"佐久間盛次の子。勝家の養子、のち佐々成政の養子になったとする系譜があります。養子縁組の経緯には不明点が残ります。", sources:["後世の佐久間氏・柴田氏系譜"]},
+  {id:"adopted_daughter", name:"氏名不詳の養女", house:"other", unnamed:true, role:"高城胤則の妻", certainty:"uncertain", note:"高城胤則の妻となった養女を記す後世の系譜があります。男性の養子だけでなく、名が残らなかった養女も同じ一人の人物として表示します(実父を中村某とする系譜あり)。", sources:["後世の柴田氏系譜"], yomi:""},
+  {id:"chacha", name:"茶々(淀殿)", house:"azai", role:"お市の長女・勝家の継娘", yomi:"ちゃちゃ", certainty:"confirmed", note:"浅井長政とお市の長女。勝家とは血縁上の親子ではなく、お市との婚姻による継父・継娘の関係です。", sources:["長浜市「江をめぐる人物関係図」"]},
+  {id:"hatsu", name:"初(常高院)", house:"azai", role:"お市の次女・勝家の継娘", yomi:"はつ", certainty:"confirmed", note:"浅井長政とお市の次女。のち京極高次の正室となりました。系図では勝家の養女と断定せず、継娘として区別します。", sources:["長浜市「江をめぐる人物関係図」"]},
+  {id:"go", name:"江(崇源院)", house:"azai", role:"お市の三女・勝家の継娘", yomi:"ごう", certainty:"confirmed", note:"浅井長政とお市の三女。のち徳川秀忠の正室となりました。母・お市を起点に、織田・浅井・柴田・徳川の各家がつながります。", sources:["長浜市「江をめぐる人物関係図」"]},
+  {id:"katsushige", name:"柴田勝重", house:"shibata", role:"勝政の子・勝家の養孫", yomi:"しばた かつしげ", certainty:"genealogy", note:"勝政の子。幼少時に北庄から逃れ、母方祖父・日根野高吉に育てられました。のち徳川家康に召し出され、柴田家の系譜を江戸時代へつなぎました(母方の保護で生き延びた系譜)。", sources:["『寛政重修諸家譜』","『系図続覧』柴田系図"]},
+  {id:"hisamasa", name:"浅井久政", house:"azai", role:"長政の父・浅井氏二代当主", yomi:"あざい ひさまさ", certainty:"confirmed", note:"浅井亮政の子。六角氏に押されて従属的な立場に置かれ、当主としては弱腰と評されることが多い。家臣団の意向で隠居に追い込まれ長政に家督を譲った後も、一定の発言力を保ったとされる。小谷城落城の際に長政と運命を共にした。", sources:["刀剣ワールド「浅井長政の歴史」","レキシル「浅井長政の子孫は現在も続く」"]},
+  {id:"ono_dono", name:"小野殿", house:"other", role:"浅井久政の妻・長政の母", yomi:"おのどの", certainty:"confirmed", note:"浅井久政の妻で、長政の生母とされる。「小野殿」は居所などに由来する呼称とみられ、実家の出自を確定する史料には乏しい。", sources:["ホームメイト「浅井長政」"]},
+  {id:"sukemasa", name:"浅井亮政", house:"azai", role:"長政の祖父・浅井氏初代当主", yomi:"あざい すけまさ", certainty:"confirmed", note:"浅井氏庶流(蔵人家)・直種の子。惣領家当主直政に男子がなかったため、その娘蔵屋と結婚して浅井氏本流の家督を継承した。京極氏の内紛に乗じて北近江を統一し、戦国大名浅井氏の基礎を築く。小谷城を築城。", sources:["コトバンク「浅井亮政」","戦国ヒストリー「浅井長政の家系図」"]},
+  {id:"kurayahime", name:"蔵屋", house:"azai", role:"浅井亮政の妻・浅井氏惣領家の娘", yomi:"くらや", certainty:"uncertain", note:"浅井氏惣領家当主・直政の娘で、亮政の妻。亮政はこの婚姻によって浅井氏本流の家督を継いだ。史料によっては亮政のもう一人の妻(尼子氏の娘)も伝わっており、久政の生母がどちらであるかは確定していない。", sources:["Weblio「浅井亮政」","harimaya.com「近江浅井氏・浅井亮政」"]},
+  {id:"naotane", name:"浅井直種", house:"azai", role:"長政の曾祖父・浅井氏庶流", yomi:"あざい なおたね", certainty:"uncertain", note:"浅井氏庶流(蔵人家)の当主。北近江の守護・京極氏に仕えた国人で、子の亮政が惣領家を継いだことで、その血筋が浅井氏本流に連なることになった。同時代史料への言及は乏しく、亮政の父とする推定は状況証拠によるところが大きい。", sources:["戦国ヒストリー「浅井長政の家系図」"]},
+  {id:"katsuoki", name:"柴田勝興", house:"shibata", role:"勝重の子(跡を継いだとみられる)", yomi:"しばた かつおき", certainty:"uncertain", note:"柴田勝重の子。史料に伝わる勝重の子(勝興・三浦信勝・勝平・勝昌など)のうち最初に挙げられることが多く、家督を継いだ人物とみられる。ただし後継の勝門との続柄を明記した一次史料は確認できておらず、推定にとどまる。", sources:["日本通信百科事典「柴田勝重」","Webcat Plus「柴田勝重」"]},
+  {id:"katsukado", name:"柴田勝門", house:"shibata", role:"勝重の孫・三河へ移封した当主", yomi:"しばた かつかど", certainty:"confirmed", note:"9歳で徳川家綱に拝謁し、父の隠居に伴い家督を継承。日光造営の功により従五位下・越前守に叙任された。のち関東(武蔵・上野)にあった3520石の知行地を三河国額田郡・宝飯郡に移され、本宿村(現・愛知県岡崎市本宿町)に陣屋を置いた。以後、旗本柴田家は幕末までこの地の領主となる。", sources:["Wikipedia「柴田勝門」","『寛政重修諸家譜』巻第三百七十二"]},
+  {id:"katsutomi", name:"柴田勝富", house:"shibata", role:"勝門の子", yomi:"しばた かつとみ", certainty:"genealogy", note:"勝門の跡を継いだ当主。子に坂本家へ養子に出た直鎮、家を継いだ勝定がいる。", sources:["Wikipedia「柴田勝門」"]},
+  {id:"katsusada", name:"柴田勝定", house:"shibata", role:"勝富の子", yomi:"しばた かつさだ", certainty:"genealogy", note:"勝富の跡を継いだ当主。", sources:["Wikipedia「柴田勝門」"]},
+  {id:"katsuhiro", name:"柴田勝曠", house:"shibata", role:"勝定の子", yomi:"しばた かつひろ", certainty:"genealogy", note:"勝定の跡を継いだ当主。", sources:["Wikipedia「柴田勝門」"]},
+  {id:"katsumitsu", name:"柴田勝満", house:"shibata", role:"勝曠の子", yomi:"しばた かつみつ", certainty:"genealogy", note:"勝曠の跡を継いだ当主。実子に恵まれず、末期養子として柴田勝房を迎えて家を継がせた。", sources:["Wikipedia「柴田勝門」"]},
+  {id:"sakamoto_naoshizu", name:"坂本直鎮", house:"other", role:"勝富の子・坂本家へ養子", yomi:"さかもと なおしず", certainty:"genealogy", note:"柴田勝富の子として生まれたが、坂本家の養子となり坂本姓を名乗った。血統としては柴田家の一員だが、家名は坂本家を継いだ。子の勝房は再び柴田家へ戻ることになる。", sources:["Wikipedia「柴田勝門」"]},
+  {id:"katsufusa", name:"柴田勝房", house:"shibata", role:"勝満の末期養子・第八代当主", yomi:"しばた かつふさ", certainty:"genealogy", note:"坂本直鎮の子。柴田家宗家の血筋にあたることから、跡継ぎのなかった勝満の末期養子として柴田家を継いだ(勝重を初代とすれば第8代当主)。家祖勝重の墓所である春清寺に柴田勝家の位牌を新たに奉納し、勝家・勝政・勝重3代の事績を記した文書(「柴田家先祖書」)を添えた。のち同寺に「柴田家家碑」を建立している。この後、柴田家は勝全(幕末当主)・勝誠(明治初年の最後の当主)へと続き、明治2年(1869)に知行地を明治政府(静岡藩)へ上知した。", sources:["Wikipedia「柴田勝門」","フォートラベル「柴田勝重の墓」クチコミ"]},
 ];
 
 const parentEdges = [
   ["katsuie_father","katsuie","父","blood"],
   ["katsuie_mother","katsuie","母","blood"],
+  ["katsuie_father","katsuie_sister","父","blood"],
+  ["katsuie_mother","katsuie_sister","母","blood"],
+  ["yoshida_jihyoe","katsutoyo","父","blood"],
+  ["katsuie_sister","katsutoyo","母","blood"],
+  ["sakuma_moritsugu","katsumasa","父","blood"],
+  ["katsuie_sister","katsumasa","母","blood"],
+  ["sakuma_moritsugu","katsuyuki","父","blood"],
+  ["katsuie_sister","katsuyuki","母","blood"],
   ["nobuhide","oichi","父","blood"],
   ["oichi_mother","oichi","母","blood"],
   ["hineno_takayoshi","katsumasa_wife","父","blood"],
@@ -452,8 +1300,10 @@ const parentEdges = [
   ["katsumitsu","katsufusa","末期養子","adoption"],
 ];
 const spouseEdges = [
-  ["katsuie","oichi","婚姻 1582","marriage", 380],
+  ["katsuie","oichi","婚姻 1582","marriage",380],
   ["oichi","nagamasa","前夫婦","former"],
+  ["katsuie_sister","yoshida_jihyoe","前夫婦","former"],
+  ["katsuie_sister","sakuma_moritsugu","再婚","marriage"],
   ["katsumasa","katsumasa_wife","婚姻","marriage"],
   ["hisamasa","ono_dono","婚姻","marriage"],
   ["sukemasa","kurayahime","婚姻","marriage"],
@@ -921,7 +1771,31 @@ function computeLayout(nodes, parentEdges, spouseEdges){
    例: { "hineno_takayoshi": {x: 750, y: 80} }
    ========================================================================= */
 const manualPositions = {
-
+  "katsumasa": {x: -400, y: 1100},
+  "katsumasa_wife": {x: -634, y: 1094},
+  "hineno_takayoshi": {x: -699, y: 889},
+  "katsuyuki": {x: -228, y: 1100},
+  "nagamasa": {x: 1029, y: 807},
+  "oichi": {x: 626, y: 805},
+  "adopted_daughter": {x: 798, y: 1079},
+  "chacha": {x: 997, y: 1081},
+  "katsusato": {x: -41, y: 1080},
+  "katsutoyo": {x: 294, y: 1080},
+  "katsutoshi": {x: 462, y: 1080},
+  "katsuharu": {x: 628, y: 1080},
+  /* ここから追加分 --------------------------------------------------
+     ①重複解消: 柴田勝忠が柴田勝豊とほぼ重なっていたため、間隔を空けて配置。
+       茶々の右隣に自動配置されていた初も重なっていたため、
+       茶々→初→江の間隔を均等に空け直した(江も連動して調整)。 */
+  "katsutada": {x: 124, y: 1080},
+  "hatsu": {x: 1167, y: 1080},
+  "go": {x: 1337, y: 1080},
+  /* ②実子を実親の近くに: 勝家の姉とその2人の夫を、実際の子(勝豊/勝政/勝之)の
+     真上に来るよう配置し、親子線をできるだけ短くした。
+     (姉は3人の子の中間、吉田次兵衛は勝豊の真上、佐久間盛次は勝政・勝之の中間) */
+  "yoshida_jihyoe": {x: 294, y: 660},
+  "sakuma_moritsugu": {x: -380, y: 751},
+  "katsuie_sister": {x: -210, y: 660},
 };
 
 /* =========================================================================
@@ -963,7 +1837,7 @@ let worldW, worldH, OFX, OFY;
    URLに ?edit=1 が付いている時だけ編集UIを有効化する。
    通常の公開URL(パラメータなし)では、編集モードボタンを隠し、
    タイトル/サブタイトルの直接編集もできないようにする。 */
-const EDIT_ALLOWED = new URLSearchParams(location.search).get('edit') === '1';
+const EDIT_ALLOWED = true; // ← これは「微調整専用ファイル」。公開版はURLパラメータ判定のまま(閲覧専用)。
 (function applyViewOnlyMode(){
   const btn = document.getElementById('editModeBtn');
   if(btn) btn.style.display = EDIT_ALLOWED ? '' : 'none';
@@ -993,18 +1867,23 @@ function edgeLabel(x,y,text){
 /* ---- 親子線・婚姻線:カードの縁から、繋がる相手の方向へ向けてまっすぐ線を引く ----
    ドラッグでカードの位置が変わっても、常に直線のまま追従する。 */
 const CARD_HW = 80, CARD_HH = 52; // カード(158px×約100px)のおおよその半分のサイズ
-function anchorPoint(cx,cy,tx,ty){
+const CARD_HW_PROTAGONIST = 115, CARD_HH_PROTAGONIST = 73; // 主人公カード(拡大版)の半分のサイズ
+function nodeHalf(n){
+  return n.protagonist ? {hw:CARD_HW_PROTAGONIST, hh:CARD_HH_PROTAGONIST} : {hw:CARD_HW, hh:CARD_HH};
+}
+function anchorPoint(cx,cy,tx,ty,hw,hh){
   const dx=tx-cx, dy=ty-cy;
   if(dx===0 && dy===0) return [cx,cy];
-  const sx = dx!==0 ? CARD_HW/Math.abs(dx) : Infinity;
-  const sy = dy!==0 ? CARD_HH/Math.abs(dy) : Infinity;
+  const sx = dx!==0 ? hw/Math.abs(dx) : Infinity;
+  const sy = dy!==0 ? hh/Math.abs(dy) : Infinity;
   const s = Math.min(sx,sy,1);
   return [cx+dx*s, cy+dy*s];
 }
 function cardEdgePoints(A,B){
   const [ax,ay]=pt(A), [bx,by]=pt(B);
-  const [x1,y1] = anchorPoint(ax,ay,bx,by);
-  const [x2,y2] = anchorPoint(bx,by,ax,ay);
+  const hA = nodeHalf(A), hB = nodeHalf(B);
+  const [x1,y1] = anchorPoint(ax,ay,bx,by,hA.hw,hA.hh);
+  const [x2,y2] = anchorPoint(bx,by,ax,ay,hB.hw,hB.hh);
   return [x1,y1,x2,y2];
 }
 
@@ -1075,7 +1954,7 @@ function renderAll(){
   nodes.forEach(n=>{
     const [x,y] = pt(n);
     const el = document.createElement('div');
-    el.className = `node house-${n.house}` + (n.unnamed ? ' unnamed' : '') + (manualPositions[n.id] || manualOverrides[n.id] || contentOverrides[n.id] ? ' manual' : '');
+    el.className = `node house-${n.house}` + (n.unnamed ? ' unnamed' : '') + (n.protagonist ? ' protagonist' : '') + (manualPositions[n.id] || manualOverrides[n.id] || contentOverrides[n.id] ? ' manual' : '');
     el.id = "node-"+n.id;
     el.style.left = x+"px"; el.style.top = y+"px";
     const cm = certaintyMeta[n.certainty];
@@ -1125,7 +2004,7 @@ function applyHighlight(id){
     el.style.opacity = onPath ? '1' : '0.12';
   });
 }
-function selectNode(id){
+function selectNode(id, opts){
   lastSelectedId = id;
   const n = nodeById[id];
   applyHighlight(id);
@@ -1139,7 +2018,7 @@ function selectNode(id){
   const srcEl = document.getElementById('pSources');
   srcEl.innerHTML = (n.sources&&n.sources.length) ? `<strong>根拠・参照</strong><ul>${n.sources.map(s=>`<li>${s}</li>`).join('')}</ul>` : '';
   panel.classList.add('show');
-  focusOn(n);
+  focusOn(n, opts && opts.zoom);
 }
 function clearSelection(){
   lastSelectedId = null;
@@ -1254,6 +2133,123 @@ function nodeLiteral(n){
 }
 function edgeLiteral(e){ return `  [${e.map(v=>jsString(v)).join(", ")}],`; }
 
+document.getElementById('saveFileBtn').addEventListener('click', ()=>{
+  try{
+    /* ---- ① nodes / parentEdges / spouseEdges は、追加・削除も含めて
+       既にこのセッション中の操作でメモリ上の配列(nodes, parentEdges, spouseEdges)
+       がそのまま最新状態になっているので、その内容をそのままコードに書き出す ---- */
+    function serializeNode(n){
+      const skip = new Set(['x','y']); // 座標は manualPositions 側で扱うので除外
+      const parts = Object.keys(n).filter(k=>!skip.has(k)).map(k=>{
+        const v = n[k];
+        return `${k}:${typeof v==='boolean' ? v : JSON.stringify(v)}`;
+      });
+      return `  {${parts.join(", ")}},`;
+    }
+    const nodesBlock = "const nodes = [\n" + nodes.map(serializeNode).join("\n") + "\n];";
+    const parentEdgesBlock = "const parentEdges = [\n" + parentEdges.map(e=>`  ${JSON.stringify(e)},`).join("\n") + "\n];";
+    const spouseEdgesBlock = "const spouseEdges = [\n" + spouseEdges.map(e=>`  ${JSON.stringify(e)},`).join("\n") + "\n];";
+
+    /* ---- ② manualPositions: 元々あった手動座標 + このセッションでドラッグした分をマージ ---- */
+    const mergedPositions = Object.assign({}, manualPositions);
+    Object.keys(manualOverrides).forEach(id=>{
+      mergedPositions[id] = { x: manualOverrides[id].x, y: manualOverrides[id].y };
+    });
+    const positionsLines = Object.keys(mergedPositions).map(id=>
+      `  ${JSON.stringify(id)}: {x: ${mergedPositions[id].x}, y: ${mergedPositions[id].y}},`
+    );
+    const manualPositionsBlock = "const manualPositions = {\n" + positionsLines.join("\n") + "\n};";
+
+    /* ---- ③ contentOverrides: 既にセッション中そのまま最新状態が入っている ---- */
+    const contentLines = Object.keys(contentOverrides).map(id=>{
+      const fields = Object.entries(contentOverrides[id]).map(([k,v])=> `${k}: ${JSON.stringify(v)}`).join(", ");
+      return `  ${JSON.stringify(id)}: {${fields}},`;
+    });
+    const contentOverridesBlock = "const contentOverrides = {\n" + contentLines.join("\n") + "\n};";
+
+    /* ---- ④ 元のスクリプト全文の該当ブロックだけを、新しい内容に差し替える ---- */
+    let updatedScript = ORIGINAL_SCRIPT_SOURCE
+      .replace(/const nodes = \[[\s\S]*?\n\];/, nodesBlock)
+      .replace(/const parentEdges = \[[\s\S]*?\n\];/, parentEdgesBlock)
+      .replace(/const spouseEdges = \[[\s\S]*?\n\];/, spouseEdgesBlock)
+      .replace(/const manualPositions = \{[\s\S]*?\n\};/, manualPositionsBlock)
+      .replace(/const contentOverrides = \{[\s\S]*?\n\};/, contentOverridesBlock);
+
+    /* ---- ⑤ ページ全体のHTML(タイトル/サブタイトルの編集はここに反映済み)を複製し、
+       スクリプト部分だけ上で作った最新版に差し替える。編集UIの一時的な表示状態
+       (パネルの開閉など)は、保存後のファイルを開いた時に変な状態で残らないよう
+       リセットしておく。 ---- */
+    const clone = document.documentElement.cloneNode(true);
+    const q = sel => clone.querySelector(sel);
+    if(q('#editPanel')) q('#editPanel').style.display = 'none';
+    if(q('#editModeBtn')){ q('#editModeBtn').textContent = '編集モード'; q('#editModeBtn').classList.remove('active'); }
+    if(q('#viewport')) q('#viewport').classList.remove('edit-mode','dragging');
+    if(q('#editForm')) q('#editForm').classList.remove('show');
+    if(q('#ef_delete_confirm')) q('#ef_delete_confirm').classList.remove('show');
+    if(q('#panel')) q('#panel').classList.remove('show');
+    if(q('#copyOutput')){ q('#copyOutput').style.display='none'; }
+    if(q('#searchResults')) q('#searchResults').style.display='none';
+    if(q('#saveOverlay')) q('#saveOverlay').classList.remove('show');
+
+    let fullHTML = "<!DOCTYPE html>\n" + clone.outerHTML;
+    fullHTML = fullHTML.split(ORIGINAL_SCRIPT_SOURCE).join(updatedScript);
+
+    /* ---- ⑥ ファイルとしてダウンロードを試みる(通常のブラウザで開いていれば成功する) ---- */
+    let filename = 'genealogy_saved.html';
+    try{
+      const base = decodeURIComponent(location.pathname).split('/').pop();
+      if(base && base.toLowerCase().endsWith('.html')) filename = base;
+    }catch(e){}
+
+    let downloadTried = false, downloadError = null;
+    try{
+      const blob = new Blob([fullHTML], {type:'text/html;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(()=> URL.revokeObjectURL(url), 3000);
+      downloadTried = true;
+    }catch(e){ downloadError = e; }
+
+    /* ---- ⑦ プレビュー画面などダウンロードがブロックされる環境でも保存できるよう、
+       常に全文をコピーできるオーバーレイを表示しておく。ダウンロードが実際に
+       成功していれば、このオーバーレイは無視してそのまま閉じてもらってよい。 ---- */
+    const overlay = document.getElementById('saveOverlay');
+    const statusEl = document.getElementById('saveOverlayStatus');
+    const textEl = document.getElementById('fullHtmlOutput');
+    textEl.value = fullHTML;
+    statusEl.textContent = downloadTried
+      ? `「${filename}」としてダウンロードを試みました。ダウンロードフォルダに保存されていれば、以下のコピー操作は不要です。`
+      : 'ダウンロード処理でエラーが発生しました。以下から全文をコピーして保存してください。';
+    overlay.classList.add('show');
+    textEl.focus(); textEl.select();
+  }catch(err){
+    alert('保存中にエラーが発生しました。お手数ですが「変更をコピー」で内容を確認してください。\n('+err.message+')');
+    console.error(err);
+  }
+});
+
+document.getElementById('copyFullHtmlBtn').addEventListener('click', ()=>{
+  const textEl = document.getElementById('fullHtmlOutput');
+  textEl.focus(); textEl.select();
+  let copied = false;
+  try{ copied = document.execCommand('copy'); }catch(e){}
+  if(!copied && navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(textEl.value).then(()=>{
+      document.getElementById('saveOverlayStatus').textContent = 'コピーしました。テキストエディタに貼り付けて「.html」で保存してください。';
+    }).catch(()=>{
+      document.getElementById('saveOverlayStatus').textContent = '自動コピーに失敗しました。テキストエリアを選択した状態でCtrl+C(Macは⌘+C)を押してください。';
+    });
+  } else {
+    document.getElementById('saveOverlayStatus').textContent = copied
+      ? 'コピーしました。テキストエディタに貼り付けて「.html」で保存してください。'
+      : '自動コピーに失敗しました。テキストエリアを選択した状態でCtrl+C(Macは⌘+C)を押してください。';
+  }
+});
+document.getElementById('saveOverlayClose').addEventListener('click', ()=>{
+  document.getElementById('saveOverlay').classList.remove('show');
+});
 document.getElementById('copyPositionsBtn').addEventListener('click', ()=>{
   const posIds = Object.keys(manualOverrides); // 新規追加分もここに含める(①に座標を書く)
   const contentIds = Object.keys(contentOverrides);
@@ -1568,12 +2564,13 @@ document.getElementById('zoomIn').addEventListener('click',()=>{ cancelAnimation
 document.getElementById('zoomOut').addEventListener('click',()=>{ cancelAnimation(); const r=viewport.getBoundingClientRect(); const mx=r.width/2,my=r.height/2; const wx=(mx-panX)/scale,wy=(my-panY)/scale; scale=clampScale(scale/1.2); panX=mx-wx*scale; panY=my-wy*scale; applyTransform(); });
 document.getElementById('resetView').addEventListener('click', ()=>{ clearSelection(); fitToView(true); });
 
-function focusOn(n){
+function focusOn(n, targetScale){
   const rect = viewport.getBoundingClientRect();
   const [x,y] = pt(n);
-  const targetPanX = rect.width/2 - x*scale;
-  const targetPanY = rect.height/2 - y*scale;
-  animateTo(scale, targetPanX, targetPanY);
+  const s = (targetScale!==undefined && targetScale!==null) ? clampScale(targetScale) : scale;
+  const targetPanX = rect.width/2 - x*s;
+  const targetPanY = rect.height/2 - y*s;
+  animateTo(s, targetPanX, targetPanY);
 }
 
 /* ---------- 検索 ---------- */
@@ -1629,7 +2626,24 @@ renderList();
 
 window.addEventListener('resize', ()=> fitToView());
 fitToView();
+
+/* ---------- ホームページ等の外部リンクから特定人物へ直接フォーカスする ----------
+   使い方: 系図ページのURLに ?person=人物ID を付けてリンクする。
+   例: shibata_katsuie_genealogy.html?person=shibata_katsuie
+   人物IDは各系図データのnodeのidと同じもの(下の nodes 配列を参照)。
+   ページを開いた瞬間、まず全体を一瞬表示してから、その人物のカードへ
+   ズームイン＆ハイライトし、右側の詳細パネルも自動で開く。 */
+const FOCUS_ZOOM_SCALE = 1.15; // クローズアップ時の倍率。読みやすさに応じて調整可(0.15〜2.6)
+(function focusFromURL(){
+  const params = new URLSearchParams(location.search);
+  const targetId = params.get('person') || (location.hash ? decodeURIComponent(location.hash.slice(1)) : null);
+  if(!targetId || !nodeById[targetId]) return;
+  requestAnimationFrame(()=>{
+    selectNode(targetId, { zoom: FOCUS_ZOOM_SCALE });
+  });
+})();
 </script>
 
-</body>
-</html>
+
+
+</body></html>
