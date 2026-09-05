@@ -190,6 +190,7 @@
     box-shadow:0 8px 24px rgba(32,30,26,.14); padding:18px; z-index:35; display:none;
   }
   .panel.show{ display:block; }
+  .panel-handle{ display:none; }
   .panel .close{ position:absolute; top:10px; right:12px; cursor:pointer; font-size:14px; color:var(--ink-soft); background:none; border:none; }
   .panel .pname{ font-family:"Shippori Antique B1", serif; font-weight:700; font-size:19px; letter-spacing:.04em; }
   .panel .pname.unnamed{ font-family:"Shippori Antique B1", serif; font-weight:500; color:var(--ink-soft); }
@@ -223,6 +224,11 @@
       box-sizing:border-box; z-index:200;
     }
     .panel .close{ top:8px; right:10px; font-size:22px; padding:6px 10px; line-height:1; }
+    .panel-handle{
+      display:block; position:absolute; top:8px; left:50%; transform:translateX(-50%);
+      width:40px; height:5px; border-radius:3px; background:var(--line,#dcdcd7); cursor:grab;
+    }
+    .panel.dragging{ transition:none !important; }
   }
 </style>
 </head>
@@ -432,6 +438,7 @@
       </div>
     </div>
     <div class="panel" id="panel">
+      <div class="panel-handle" id="panelHandle"></div>
       <button class="close" id="panelClose">✕</button>
       <div class="pname" id="pName"></div>
       <div class="pyomi" id="pYomi"></div>
@@ -1659,6 +1666,54 @@ function clearSelection(){
 }
 document.getElementById('panelClose').addEventListener('click', clearSelection);
 viewport.addEventListener('click', (e)=>{ if(panMoved){ panMoved=false; return; } clearSelection(); });
+
+/* ---------- スマホ幅:パネルを下スワイプで閉じる ---------- */
+(function(){
+  const panelEl = document.getElementById('panel');
+  const handle = document.getElementById('panelHandle');
+  let dragging = false, startY = 0, currentDy = 0;
+  const DISMISS_THRESHOLD = 90;
+
+  function isMobileSheet(){ return window.matchMedia('(max-width:640px)').matches; }
+
+  function onStart(clientY, fromHandle){
+    if(!isMobileSheet()) return false;
+    // ハンドル以外から始める場合は、パネル内が一番上までスクロールされている時だけ許可
+    if(!fromHandle && panelEl.scrollTop > 0) return false;
+    dragging = true; startY = clientY; currentDy = 0;
+    panelEl.classList.add('dragging');
+    return true;
+  }
+  function onMove(clientY){
+    if(!dragging) return;
+    const dy = clientY - startY;
+    if(dy <= 0){ currentDy = 0; panelEl.style.transform = ''; return; }
+    currentDy = dy;
+    panelEl.style.transform = `translateY(${dy}px)`;
+  }
+  function onEnd(){
+    if(!dragging) return;
+    dragging = false;
+    panelEl.classList.remove('dragging');
+    if(currentDy > DISMISS_THRESHOLD){
+      panelEl.style.transform = `translateY(100%)`;
+      setTimeout(()=>{ clearSelection(); panelEl.style.transform=''; }, 160);
+    } else {
+      panelEl.style.transform = '';
+    }
+    currentDy = 0;
+  }
+
+  handle.addEventListener('touchstart', (e)=>{ if(onStart(e.touches[0].clientY, true)) e.preventDefault(); }, {passive:false});
+  panelEl.addEventListener('touchstart', (e)=>{ onStart(e.touches[0].clientY, false); }, {passive:true});
+  panelEl.addEventListener('touchmove', (e)=>{
+    if(!dragging) return;
+    e.preventDefault();
+    onMove(e.touches[0].clientY);
+  }, {passive:false});
+  panelEl.addEventListener('touchend', onEnd);
+  panelEl.addEventListener('touchcancel', onEnd);
+})();
 
 
 /* ---------- パン & ズーム ---------- */
